@@ -1,0 +1,54 @@
+---
+# Ansible playbook to sync etcd hosts to AWX inventory
+# Run this from AWX as a Job Template
+
+- name: Sync etcd hosts to AWX inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # These can be overridden via AWX Survey or Extra Variables
+    etcd_server: "{{ lookup('env', 'ETCD_SERVER') | default('10.0.25.44', true) }}"
+    etcd_port: "{{ lookup('env', 'ETCD_PORT') | default('2379', true) }}"
+    etcd_prefix: "{{ lookup('env', 'ETCD_PREFIX') | default('/discovery/', true) }}"
+    awx_server: "{{ lookup('env', 'AWX_SERVER') | default('10.0.74.5', true) }}"
+    awx_inventory_name: "{{ lookup('env', 'AWX_INVENTORY_NAME') | default('central inventory', true) }}"
+
+    # Script location (relative to project root)
+    script_path: "{{ playbook_dir }}/../etcd_to_awx.py"
+
+  tasks:
+    - name: Ensure required Python packages are installed
+      ansible.builtin.pip:
+        name:
+          - etcd3
+          - requests
+          - "protobuf>=3.19.0,<4.0.0"
+        state: present
+      become: false
+
+    - name: Run etcd to AWX sync script
+      ansible.builtin.command:
+        cmd: "python3 {{ script_path }}"
+      environment:
+        ETCD_SERVER: "{{ etcd_server }}"
+        ETCD_PORT: "{{ etcd_port }}"
+        ETCD_PREFIX: "{{ etcd_prefix }}"
+        AWX_SERVER: "{{ awx_server }}"
+        AWX_INVENTORY_NAME: "{{ awx_inventory_name }}"
+        AWX_CLIENT_ID: "{{ awx_client_id }}"
+        AWX_CLIENT_SECRET: "{{ awx_client_secret }}"
+        AWX_USERNAME: "{{ awx_username }}"
+        AWX_PASSWORD: "{{ awx_password }}"
+      register: sync_result
+      changed_when: "'Added host' in sync_result.stdout"
+
+    - name: Display sync output
+      ansible.builtin.debug:
+        var: sync_result.stdout_lines
+
+    - name: Display sync summary
+      ansible.builtin.debug:
+        msg: "Sync completed successfully!"
+      when: sync_result.rc == 0

@@ -196,6 +196,30 @@ If you see `unauthorized_client` error, ensure:
 - Verify the `ETCD_PREFIX` matches your etcd data structure
 - Check etcd contains data with `viv_privip` or `viv_pubip` keys
 
+## Running from AWX
+
+The recommended way to run this sync is directly from AWX:
+
+1. Create an AWX Project pointing to this repository
+2. Create a Job Template using the included playbook
+3. Schedule it to run twice daily
+
+See **[docs/AWX_SETUP.md](docs/AWX_SETUP.md)** for detailed instructions.
+
+### Quick AWX Setup
+
+```
+AWX Project  →  Job Template  →  Schedule (6 AM & 6 PM)
+     ↓
+GitHub Repo (auto-sync)
+```
+
+| AWX Component | Value |
+|---------------|-------|
+| Project URL | `https://github.com/anubhavarya10/etcd-awx-sync.git` |
+| Playbook | `playbooks/sync_inventory.yml` |
+| Branch | `main` |
+
 ## License
 
 MIT
