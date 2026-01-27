@@ -42,12 +42,12 @@ cp .env.example .env
 2. Edit `.env` with your configuration:
 ```bash
 # etcd Configuration
-ETCD_SERVER=10.0.25.44
-ETCD_PORT=2379
+ETCD_SERVER=10.0.00.00
+ETCD_PORT=****
 ETCD_PREFIX=/discovery/
 
 # AWX Configuration
-AWX_SERVER=10.0.74.5
+AWX_SERVER=10.0.00.0
 AWX_INVENTORY_NAME=central inventory
 
 # AWX Authentication (choose one option)
@@ -86,9 +86,9 @@ export AWX_PASSWORD='your_password'
 source .env
 
 # Or export variables directly
-export ETCD_SERVER=10.0.25.44
-export ETCD_PORT=2379
-export AWX_SERVER=10.0.74.5
+export ETCD_SERVER=10.0.00.00
+export ETCD_PORT=****
+export AWX_SERVER=10.0.00.00
 export AWX_CLIENT_ID=your_client_id
 export AWX_CLIENT_SECRET=your_client_secret
 export AWX_USERNAME=admin
@@ -146,7 +146,7 @@ etcd to AWX Inventory Sync
 Using OAuth2 Resource Owner Password-Based authentication
 
 [1] Fetching hosts from etcd...
-Connected to etcd at 10.0.25.44:2379
+Connected to etcd at 10.00.00.00:0000
 Total hosts found in etcd: 360
 
 [2] Authenticating with AWX...
@@ -190,7 +190,7 @@ If you see `unauthorized_client` error, ensure:
 
 ### Connection Issues
 - Verify etcd and AWX servers are reachable
-- Check firewall rules for ports 2379 (etcd) and 80/443 (AWX)
+- Check firewall rules for ports **** (etcd) and 80/443 (AWX)
 
 ### No Hosts Found
 - Verify the `ETCD_PREFIX` matches your etcd data structure
