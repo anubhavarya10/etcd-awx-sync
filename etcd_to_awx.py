@@ -244,16 +244,14 @@ def filter_hosts(
                 if domain_filter.lower() not in hostname.lower():
                     continue
 
-        # Check role filter
+        # Check role filter - EXACT MATCH ONLY
         if role_filter:
             host_role = info.get('role', '').lower() if info.get('role') else ''
             role_filter_lower = role_filter.lower()
 
-            # Match role exactly or as prefix in hostname
+            # Exact role match only (mim != mimmem)
             if host_role != role_filter_lower:
-                # Also check if role is in hostname
-                if not hostname.lower().startswith(role_filter_lower):
-                    continue
+                continue
 
         filtered[hostname] = info
 
