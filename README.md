@@ -1,141 +1,128 @@
 # etcd to AWX Inventory Sync
 
-A Python script that synchronizes host information from etcd to AWX (Ansible Tower) inventory.
+A Python script that synchronizes host information from etcd to AWX (Ansible Tower) inventory with smart filtering and natural language support.
 
 ## Features
 
-- Fetches hosts from etcd with their IP addresses (private, public)
-- Creates/updates inventory in AWX
-- Automatically creates host groups based on hostname patterns:
-  - **Customer groups**: `customer-<name>`
-  - **Server type groups**: `gen-comp`, `sriov-comp`, `etcd`, `mphpp`
-  - **Location groups**: `location-bos`, `location-chn`
-  - **Cluster groups**: `cluster-os1`, `cluster-os2`, `cluster-os-chn`
-  - **Combined groups**: `os1-sriov`, `os1-gen`, `os2-sriov`, `os2-gen`, `chn-sriov`, `chn-gen`
-- Supports multiple AWX authentication methods
-- Idempotent - safe to run multiple times
+- **Dynamic Discovery**: Automatically discovers all domains and roles from etcd (no hardcoded lists)
+- **Smart Prompt Mode**: Create inventories using natural language (e.g., "mphpp servers for pubwxp")
+- **Flexible Filtering**: Filter by domain, role, or both with exact matching
+- **Auto Host Groups**: Creates groups based on customer, role, location, and cluster patterns
+- **Multiple Auth Methods**: Supports OAuth2, Personal Access Token, and Basic auth
+- **Idempotent**: Safe to run multiple times - updates existing hosts
 
-## Prerequisites
+## Current Statistics
 
-- Python 3.8+
-- Access to etcd server
-- Access to AWX server with API credentials
+| Metric | Count |
+|--------|-------|
+| Total Hosts | ~2,800+ |
+| Domains/Customers | 142 |
+| Discovered Roles | 56 |
 
-## Installation
+Top roles: `mphpp` (915), `os` (335), `mim` (286), `www` (241), `mphhos` (140), `ts` (127)
+
+## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/etcd-awx-sync.git
+# Clone and install
+git clone https://github.com/anubhavarya10/etcd-awx-sync.git
 cd etcd-awx-sync
-
-# Install dependencies
 pip install -r requirements.txt
+
+# Configure
+cp .env.example .env
+# Edit .env with your credentials
+
+# Run
+source .env && python3 etcd_to_awx.py --smart
 ```
+
+## Usage Examples
+
+### Smart Prompt Mode (Interactive)
+```bash
+python3 etcd_to_awx.py --smart
+```
+Then type natural language requests:
+- `mphpp servers for pubwxp`
+- `all ts servers`
+- `mim for lolxp domain`
+- `pubwxp` (domain only)
+- `mphhos` (role only)
+
+### Direct Prompt (Non-Interactive)
+```bash
+# Combined filter: role + domain
+python3 etcd_to_awx.py --prompt "mphpp for pubwxp"
+
+# Role only (all domains)
+python3 etcd_to_awx.py --prompt "all mim servers"
+
+# Domain only (all roles)
+python3 etcd_to_awx.py --prompt "valxp inventory"
+```
+
+### CLI Flags
+```bash
+# Full sync (all hosts)
+python3 etcd_to_awx.py --full
+
+# Filter by domain
+python3 etcd_to_awx.py --domain pubwxp
+
+# Filter by role
+python3 etcd_to_awx.py --role mphpp
+
+# Combined filter
+python3 etcd_to_awx.py --role mphpp --domain pubwxp
+
+# Custom inventory name
+python3 etcd_to_awx.py --role ts --domain valxp --inventory-name "ts-valxp-prod"
+
+# List available domains
+python3 etcd_to_awx.py --list-domains
+
+# List available roles
+python3 etcd_to_awx.py --list-roles
+```
+
+### Interactive Menu Mode
+```bash
+python3 etcd_to_awx.py
+```
+Choose from:
+1. Full sync (all hosts)
+2. Domain-specific inventory
+3. Role-specific inventory
+4. Combined filter (role + domain)
 
 ## Configuration
 
-1. Copy the example environment file:
-```bash
-cp .env.example .env
-```
+### Environment Variables
 
-2. Edit `.env` with your configuration:
 ```bash
 # etcd Configuration
-ETCD_SERVER=10.0.00.00
-ETCD_PORT=****
+ETCD_SERVER=10.0.25.44
+ETCD_PORT=2379
 ETCD_PREFIX=/discovery/
 
 # AWX Configuration
-AWX_SERVER=10.0.00.0
-AWX_INVENTORY_NAME=central inventory
+AWX_SERVER=10.0.74.5
 
-# AWX Authentication (choose one option)
+# AWX Authentication - OAuth2 Resource Owner Password-Based
 AWX_CLIENT_ID=your_client_id
 AWX_CLIENT_SECRET=your_client_secret
-AWX_USERNAME=your_username
+AWX_USERNAME=admin
 AWX_PASSWORD=your_password
 ```
 
-## AWX Authentication Options
+### Authentication Options
 
-### Option 1: Personal Access Token (Recommended)
-```bash
-export AWX_TOKEN='your_personal_access_token'
-```
-
-### Option 2: OAuth2 Resource Owner Password-Based
-```bash
-export AWX_CLIENT_ID='your_client_id'
-export AWX_CLIENT_SECRET='your_client_secret'
-export AWX_USERNAME='your_username'
-export AWX_PASSWORD='your_password'
-```
-
-### Option 3: Basic Username/Password
-```bash
-export AWX_USERNAME='your_username'
-export AWX_PASSWORD='your_password'
-```
-
-## Usage
-
-### Manual Run
-```bash
-# Source your environment file
-source .env
-
-# Or export variables directly
-export ETCD_SERVER=10.0.00.00
-export ETCD_PORT=****
-export AWX_SERVER=10.0.00.00
-export AWX_CLIENT_ID=your_client_id
-export AWX_CLIENT_SECRET=your_client_secret
-export AWX_USERNAME=admin
-export AWX_PASSWORD=your_password
-
-# Run the sync
-python3 etcd_to_awx.py
-```
-
-### Scheduled Sync (Cron)
-
-To run the sync twice daily (at 6 AM and 6 PM), add to crontab:
-
-```bash
-# Edit crontab
-crontab -e
-
-# Add these lines (adjust paths as needed)
-0 6 * * * /path/to/etcd-awx-sync/run_sync.sh >> /var/log/etcd-awx-sync.log 2>&1
-0 18 * * * /path/to/etcd-awx-sync/run_sync.sh >> /var/log/etcd-awx-sync.log 2>&1
-```
-
-Create a wrapper script `run_sync.sh`:
-```bash
-#!/bin/bash
-cd /path/to/etcd-awx-sync
-source .env
-python3 etcd_to_awx.py
-```
-
-## etcd Data Structure
-
-The script expects data in etcd with the following structure:
-```
-/discovery/<customer>/<subdirectory>/<hostname>/viv_privip  -> private IP
-/discovery/<customer>/<subdirectory>/<hostname>/viv_pubip   -> public IP
-/discovery/<customer>/<subdirectory>/<hostname>/viv_ipaddresses -> all IPs
-```
-
-## Host Variables
-
-Each host in AWX will have the following variables:
-- `ansible_host`: Primary IP (prefers private IP)
-- `private_ip`: Private IP address
-- `public_ip`: Public IP address
-- `all_ips`: All IP addresses
-- `customer`: Customer name from etcd path
+| Method | Required Variables |
+|--------|-------------------|
+| OAuth2 (Recommended) | `AWX_CLIENT_ID`, `AWX_CLIENT_SECRET`, `AWX_USERNAME`, `AWX_PASSWORD` |
+| Personal Access Token | `AWX_TOKEN` |
+| Basic Auth | `AWX_USERNAME`, `AWX_PASSWORD` |
 
 ## Output Example
 
@@ -146,79 +133,112 @@ etcd to AWX Inventory Sync
 Using OAuth2 Resource Owner Password-Based authentication
 
 [1] Fetching hosts from etcd...
-Connected to etcd at 10.00.00.00:0000
-Total hosts found in etcd: 360
+Connected to etcd at 10.0.25.44:2379
 
-[2] Authenticating with AWX...
+Total hosts found in etcd: 2862
+Total domains/customers: 142
+Total roles discovered: 56
+
+Parsed prompt: domain=pubwxp, role=mphpp
+Inventory name: mphpp-pubwxp
+
+[2] Applying filters...
+    Domain filter: pubwxp
+    Role filter: mphpp
+    Hosts after filtering: 72
+
+[3] Authenticating with AWX...
 Successfully obtained OAuth token
 Successfully connected to AWX
 
-[3] Getting organization...
+[4] Getting organization...
 Using organization: Default (ID: 1)
 
-[4] Creating inventory...
-Created inventory 'central inventory' (ID: 3)
+[5] Creating inventory 'mphpp-pubwxp'...
+Inventory 'mphpp-pubwxp' already exists (ID: 4)
 
-[5] Adding hosts to inventory...
-Added host 'server1.example.com' with IP 10.0.1.1 (ID: 1)
-...
+[6] Adding 72 hosts to inventory...
+  Progress: 72/72 hosts processed...
 
-[6] Creating groups and assigning hosts...
-Created group 'customer-vx' (ID: 1)
-Created group 'gen-comp' (ID: 2)
-...
+[7] Creating groups and assigning hosts...
 
 ============================================================
-Sync completed!
-Inventory: central inventory (ID: 3)
-Hosts added/found: 360
+SYNC COMPLETED!
+============================================================
+Inventory: mphpp-pubwxp (ID: 4)
+Hosts synced: 72
+Domain filter: pubwxp
+Role filter: mphpp
 
-Groups created/updated: 15
-  - cluster-os1: 200 hosts
-  - gen-comp: 100 hosts
-  - sriov-comp: 260 hosts
-  ...
+Groups created/updated: 2
+  - customer-pubwxp: 72 hosts
+  - role-mphpp: 72 hosts
 ============================================================
 ```
+
+## Host Groups
+
+The script automatically creates groups based on hostname patterns:
+
+| Group Type | Example | Description |
+|------------|---------|-------------|
+| Customer | `customer-pubwxp` | Based on etcd path |
+| Role | `role-mphpp` | Extracted from hostname |
+| Location | `location-bos` | Geographic location |
+| Cluster | `cluster-os1` | Infrastructure cluster |
+| Server Type | `gen-comp`, `sriov-comp` | Compute type |
+
+## etcd Data Structure
+
+Expected path format:
+```
+/discovery/<customer>/.../<hostname>/viv_privip     -> private IP
+/discovery/<customer>/.../<hostname>/viv_pubip      -> public IP
+/discovery/<customer>/.../<hostname>/viv_ipaddresses -> all IPs
+```
+
+## Role Extraction
+
+Roles are extracted from hostnames using the pattern `<role>-<domain>-<id>`:
+- `mphpp-pubwxp-010103-1.vivox.com` → role: `mphpp`
+- `ts-valxp-010101-1.vivox.com` → role: `ts`
+- `www5-lionamxp-024901-1.vivox.com` → role: `www`
+
+Role filtering uses **exact match** only (e.g., `mim` won't match `mimmem`).
+
+## Running from AWX
+
+The recommended way to run scheduled syncs is directly from AWX:
+
+1. Create an AWX Project pointing to this repository
+2. Create a Job Template using `playbooks/sync_inventory.yml`
+3. Add credentials via custom credential type or extra variables
+4. Schedule to run twice daily (6 AM and 6 PM)
+
+See **[docs/AWX_SETUP.md](docs/AWX_SETUP.md)** for detailed setup instructions.
+
+### Quick AWX Reference
+
+| Component | Value |
+|-----------|-------|
+| Repository | `https://github.com/anubhavarya10/etcd-awx-sync.git` |
+| Playbook | `playbooks/sync_inventory.yml` |
+| Branch | `main` |
 
 ## Troubleshooting
 
 ### OAuth Token Error
-If you see `unauthorized_client` error, ensure:
-- Your AWX OAuth application uses "Resource Owner Password-Based" grant type
-- All 4 credentials are provided: client_id, client_secret, username, password
-
-### Connection Issues
-- Verify etcd and AWX servers are reachable
-- Check firewall rules for ports **** (etcd) and 80/443 (AWX)
+If you see `unauthorized_client`:
+- Ensure AWX OAuth app uses "Resource Owner Password-Based" grant type
+- Verify all 4 credentials are provided
 
 ### No Hosts Found
-- Verify the `ETCD_PREFIX` matches your etcd data structure
-- Check etcd contains data with `viv_privip` or `viv_pubip` keys
+- Check `ETCD_PREFIX` matches your data structure
+- Verify etcd contains `viv_privip` or `viv_pubip` keys
 
-## Running from AWX
-
-The recommended way to run this sync is directly from AWX:
-
-1. Create an AWX Project pointing to this repository
-2. Create a Job Template using the included playbook
-3. Schedule it to run twice daily
-
-See **[docs/AWX_SETUP.md](docs/AWX_SETUP.md)** for detailed instructions.
-
-### Quick AWX Setup
-
-```
-AWX Project  →  Job Template  →  Schedule (6 AM & 6 PM)
-     ↓
-GitHub Repo (auto-sync)
-```
-
-| AWX Component | Value |
-|---------------|-------|
-| Project URL | `https://github.com/anubhavarya10/etcd-awx-sync.git` |
-| Playbook | `playbooks/sync_inventory.yml` |
-| Branch | `main` |
+### Role Not Matching
+- Role filtering uses exact match only
+- Use `--list-roles` to see available roles
 
 ## License
 
