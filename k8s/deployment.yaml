@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slack-mcp-agent
+  labels:
+    app: slack-mcp-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slack-mcp-agent
+  template:
+    metadata:
+      labels:
+        app: slack-mcp-agent
+    spec:
+      containers:
+        - name: agent
+          image: slack-mcp-agent:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: health
+          envFrom:
+            - configMapRef:
+                name: slack-mcp-agent-config
+            - secretRef:
+                name: slack-mcp-agent-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: etcd-awx-sync
+              mountPath: /app/etcd-awx-sync
+              readOnly: true
+      volumes:
+        - name: etcd-awx-sync
+          configMap:
+            name: etcd-awx-sync-code
+            optional: true
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slack-mcp-agent
+  labels:
+    app: slack-mcp-agent
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: health
+      name: health
+  selector:
+    app: slack-mcp-agent

@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: default
+
+resources:
+  - deployment.yaml
+  - configmap.yaml
+  - secret.yaml
+
+commonLabels:
+  app.kubernetes.io/name: slack-mcp-agent
+  app.kubernetes.io/component: agent
+  app.kubernetes.io/part-of: vops
+
+images:
+  - name: slack-mcp-agent
+    newName: your-registry/slack-mcp-agent
+    newTag: latest
