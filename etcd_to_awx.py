@@ -28,12 +28,8 @@ AWX_CLIENT_SECRET = os.environ.get("AWX_CLIENT_SECRET")
 AWX_USERNAME = os.environ.get("AWX_USERNAME")
 AWX_PASSWORD = os.environ.get("AWX_PASSWORD")
 
-# Known roles - extracted from hostname patterns
-KNOWN_ROLES = [
-    'mphpp', 'mphhos', 'mim', 'ts', 'provnstatdb5', 'sdecoder', 'srouter',
-    'hamim', 'haweb', 'nginx', 'etcd', 'tps', 'www', 'api', 'db', 'redis',
-    'kafka', 'zookeeper', 'consul', 'vault', 'prometheus', 'grafana'
-]
+# Note: Roles and domains are discovered dynamically from etcd
+# No hardcoded lists - the script adapts to whatever is in etcd
 
 
 def check_required_env_vars():
@@ -315,13 +311,12 @@ def display_filter_menu(domains: Set[str], roles: Set[str]) -> Tuple[Optional[st
     elif choice == '3':
         # Role-specific
         print("\n" + "-" * 40)
-        print("Known roles:")
-        for i, r in enumerate(sorted(KNOWN_ROLES), 1):
+        print("Available roles (discovered from etcd):")
+        sorted_roles = sorted(roles)
+        for i, r in enumerate(sorted_roles[:30], 1):
             print(f"  {i:2}. {r}")
-        print("\nDiscovered roles in etcd:")
-        discovered = sorted(roles - set(KNOWN_ROLES))[:20]
-        for r in discovered:
-            print(f"      {r}")
+        if len(roles) > 30:
+            print(f"  ... and {len(roles) - 30} more")
         print("-" * 40)
 
         role_filter = input("\nEnter role name (e.g., mphpp): ").strip()
@@ -338,7 +333,9 @@ def display_filter_menu(domains: Set[str], roles: Set[str]) -> Tuple[Optional[st
         print("-" * 40)
 
         # Get role
-        print("\nKnown roles:", ', '.join(sorted(KNOWN_ROLES)))
+        print("\nAvailable roles:", ', '.join(sorted(roles)[:20]))
+        if len(roles) > 20:
+            print(f"  ... and {len(roles) - 20} more")
         role_filter = input("Enter role name (e.g., mphpp): ").strip()
 
         # Get domain
@@ -593,6 +590,7 @@ def parse_natural_language_prompt(
 ) -> Tuple[Optional[str], Optional[str], str]:
     """
     Parse a natural language prompt to extract domain and role filters.
+    Uses dynamically discovered domains and roles from etcd.
 
     Examples:
     - "Create inventory for mphpp in pubwxp"
@@ -621,28 +619,22 @@ def parse_natural_language_prompt(
     domain_filter = None
     role_filter = None
 
-    # First, try to find exact matches for domains and roles
+    # Create lowercase lookup sets for faster matching
+    domains_lower = {d.lower(): d for d in available_domains}
+    roles_lower = {r.lower(): r for r in available_roles}
+
+    # Find matches for domains and roles from discovered data
     for word in words:
         if word in filler_words:
             continue
 
-        # Check if it's a domain
-        if word in [d.lower() for d in available_domains]:
-            for d in available_domains:
-                if d.lower() == word:
-                    domain_filter = d
-                    break
+        # Check if it's a domain (exact match from discovered domains)
+        if word in domains_lower:
+            domain_filter = domains_lower[word]
 
-        # Check if it's a role
-        if word in [r.lower() for r in available_roles]:
-            for r in available_roles:
-                if r.lower() == word:
-                    role_filter = r
-                    break
-
-        # Check known roles
-        if word in [r.lower() for r in KNOWN_ROLES]:
-            role_filter = word
+        # Check if it's a role (exact match from discovered roles)
+        if word in roles_lower:
+            role_filter = roles_lower[word]
 
     # Build inventory name
     if role_filter and domain_filter:
