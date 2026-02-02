@@ -15,9 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY main.py .
 
-# Clone or copy etcd-awx-sync (can be overridden by volume mount)
-# For production, this would typically be a git clone or mounted volume
-RUN mkdir -p /app/etcd-awx-sync
+# Copy etcd_to_awx sync script
+COPY etcd_to_awx.py ./etcd-awx-sync/
 
 # Set environment variables
 ENV PYTHONPATH="/app:/app/etcd-awx-sync"
