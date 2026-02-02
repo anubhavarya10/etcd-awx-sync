@@ -1,6 +1,73 @@
-# Slack MCP Agent
+# etcd-awx-sync
 
-An AI-powered Slack bot that handles infrastructure operations through modular MCP (Model Context Protocol) handlers. Currently integrates with etcd service discovery and AWX for inventory management.
+Tools for synchronizing host information from etcd service discovery to AWX (Ansible Tower) inventory. Includes both a CLI tool and an AI-powered Slack bot.
+
+## Components
+
+| Component | Description |
+|-----------|-------------|
+| `etcd_to_awx.py` | CLI tool for direct sync operations |
+| `slack-mcp-agent` | AI-powered Slack bot with natural language support |
+
+## Current Statistics
+
+| Metric | Count |
+|--------|-------|
+| Total Hosts | ~2,900+ |
+| Domains/Customers | 142 |
+| Discovered Roles | 56 |
+
+Top roles: `mphpp` (915), `os` (335), `mim` (286), `www` (241), `mphhos` (140), `ts` (127)
+
+---
+
+# Part 1: CLI Tool (etcd_to_awx.py)
+
+## Features
+
+- **Dynamic Discovery**: Automatically discovers all domains and roles from etcd
+- **Smart Prompt Mode**: Create inventories using natural language
+- **Flexible Filtering**: Filter by domain, role, or both
+- **Auto Host Groups**: Creates groups based on customer, role, location, cluster
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your credentials
+
+# Smart prompt mode
+python3 etcd_to_awx.py --smart
+
+# Direct prompt
+python3 etcd_to_awx.py --prompt "mphpp for pubwxp"
+
+# CLI flags
+python3 etcd_to_awx.py --role mphpp --domain pubwxp
+```
+
+## CLI Usage
+
+```bash
+# Full sync (all hosts)
+python3 etcd_to_awx.py --full
+
+# List available domains/roles
+python3 etcd_to_awx.py --list-domains
+python3 etcd_to_awx.py --list-roles
+
+# Filter by domain and/or role
+python3 etcd_to_awx.py --domain pubwxp
+python3 etcd_to_awx.py --role mphpp
+python3 etcd_to_awx.py --role mphpp --domain pubwxp
+```
+
+---
+
+# Part 2: Slack Bot (slack-mcp-agent)
+
+An AI-powered Slack bot that handles infrastructure operations through natural language.
 
 ## Architecture
 
@@ -41,23 +108,13 @@ An AI-powered Slack bot that handles infrastructure operations through modular M
          └─────────┘          └─────────┘
 ```
 
-## Features
-
-- **Natural Language Understanding**: Uses LLM to parse user requests (Unity AI, Anthropic, or Mock for testing)
-- **Modular MCP Architecture**: Pluggable handlers for different operations
-- **Confirmation Workflow**: Confirms destructive actions before execution
-- **Kubernetes Native**: Health checks, proper lifecycle management
-- **etcd Integration**: Reads host data from etcd service discovery
-- **Hostname Parsing**: Parses `<role>-<domain>-<numbers>-<index>.vivox.com` pattern
-
-## Available Commands
+## Slack Commands
 
 ### Query Commands (no confirmation needed)
 ```
 /agent list domains              # Show all domains with host counts
 /agent list roles                # Show all roles with host counts
 /agent list roles in bnxp        # Show roles in specific domain
-/agent list domains for mphpp    # Show domains with specific role
 /agent status                    # Show overall statistics
 /agent how many mphpp does bnxp have    # Count specific role in domain
 /agent how many hosts does lolxp have   # Count total hosts in domain
@@ -72,20 +129,13 @@ An AI-powered Slack bot that handles infrastructure operations through modular M
 
 ## Deployment
 
-### Prerequisites
-
-- Docker with buildx (for multi-platform builds)
-- Access to Google Artifact Registry (GAR)
-- Kubernetes cluster (on-prem or cloud)
-- etcd server with service discovery data
-
 ### Build and Push Docker Image
 
 ```bash
-# Login to GAR (one-time setup)
+# Login to GAR
 gcloud auth configure-docker us-east1-docker.pkg.dev
 
-# Build for amd64 (required for most K8s clusters) and push
+# Build for amd64 and push
 docker buildx build --platform linux/amd64 \
   -t us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/slack-mcp-agent:latest \
   --push .
@@ -93,162 +143,104 @@ docker buildx build --platform linux/amd64 \
 
 ### Deploy to Kubernetes
 
-1. **Create image pull secret** (for pulling from GAR):
 ```bash
-# Create service account key in GCP Console, then:
+# Create image pull secret
 kubectl create secret docker-registry gcr-secret \
   --docker-server=us-east1-docker.pkg.dev \
   --docker-username=_json_key \
   --docker-password="$(cat /path/to/gcr-key.json)" \
   --docker-email=your-email@example.com
-```
 
-2. **Create Slack secrets**:
-```bash
+# Create Slack secrets
 kubectl create secret generic slack-mcp-agent-secrets \
   --from-literal=SLACK_BOT_TOKEN=xoxb-your-token \
   --from-literal=SLACK_APP_TOKEN=xapp-your-token \
   --from-literal=SLACK_SIGNING_SECRET=your-secret
-```
 
-3. **Deploy**:
-```bash
+# Deploy
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/deployment.yaml
 
-# Or use the deploy script
-cd k8s && ./deploy.sh
-```
-
-4. **Verify**:
-```bash
-kubectl get pods -l app=slack-mcp-agent
-kubectl logs -l app=slack-mcp-agent -f
-```
-
-### Restart after code changes
-
-```bash
-# Rebuild and push image
-docker buildx build --platform linux/amd64 \
-  -t us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/slack-mcp-agent:latest \
-  --push .
-
-# Restart pod to pull new image
+# Restart after code changes
 kubectl rollout restart deployment slack-mcp-agent
 ```
 
-## Configuration
+---
 
-### Environment Variables
+# Configuration
+
+## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) | Required |
-| `SLACK_APP_TOKEN` | Slack app token for Socket Mode (xapp-...) | Required |
-| `SLACK_SIGNING_SECRET` | Slack signing secret | Optional |
-| `LLM_PROVIDER` | LLM provider (unity, anthropic, mock) | mock |
-| `UNITY_AI_API_KEY` | Unity AI API key | Required if provider=unity |
 | `ETCD_SERVER` | etcd server hostname | localhost |
 | `ETCD_PORT` | etcd server port | 2379 |
 | `ETCD_PREFIX` | etcd key prefix | /discovery/ |
 | `AWX_SERVER` | AWX server hostname | localhost |
-| `LOG_LEVEL` | Logging level | INFO |
-
-## Project Structure
-
-```
-slack-mcp-agent/
-├── src/
-│   ├── agent.py           # Main Slack agent with event handlers
-│   ├── llm_client.py      # LLM integration (Unity AI, Anthropic, Mock)
-│   └── mcps/
-│       ├── base.py        # Base MCP class and types
-│       ├── registry.py    # MCP registry for routing
-│       └── etcd_awx/
-│           └── mcp.py     # etcd-awx-sync MCP implementation
-├── k8s/
-│   ├── deployment.yaml    # K8s deployment with health checks
-│   ├── configmap.yaml     # Non-sensitive configuration
-│   ├── secret.yaml.template  # Template for secrets
-│   └── deploy.sh          # Deployment script
-├── main.py                # Entry point
-├── Dockerfile
-└── requirements.txt
-```
+| `AWX_CLIENT_ID` | AWX OAuth client ID | - |
+| `AWX_CLIENT_SECRET` | AWX OAuth client secret | - |
+| `AWX_USERNAME` | AWX username | - |
+| `AWX_PASSWORD` | AWX password | - |
+| `SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) | Required for bot |
+| `SLACK_APP_TOKEN` | Slack app token (xapp-...) | Required for bot |
+| `LLM_PROVIDER` | LLM provider (unity, anthropic, mock) | mock |
 
 ## Hostname Parsing
 
-The etcd-awx MCP parses hostnames from etcd keys using this pattern:
-```
-<role>-<domain>-<numbers>-<index>.vivox.com
-```
+Hostnames are parsed using the pattern: `<role>-<domain>-<numbers>-<index>.vivox.com`
 
 Examples:
 - `mphhos-aptus2-010103-1.vivox.com` → role=mphhos, domain=aptus2
 - `mim-bnxp-010101-2.vivox.com` → role=mim, domain=bnxp
 - `ngx-dcuxp-010103-1.vivox.com` → role=ngx, domain=dcuxp
 
-## Adding New MCPs
+---
 
-1. Create directory under `src/mcps/`
-2. Implement `BaseMCP` class
-3. Register in `src/mcps/__init__.py`
+# Project Structure
 
-```python
-from ..base import BaseMCP, MCPAction, MCPResult
-
-class MyMCP(BaseMCP):
-    @property
-    def name(self) -> str:
-        return "my-mcp"
-
-    @property
-    def description(self) -> str:
-        return "My custom MCP"
-
-    def _setup_actions(self):
-        self.register_action(MCPAction(
-            name="my-action",
-            description="Does something useful",
-            examples=["do the thing"],
-        ))
-
-    async def execute(self, action, parameters, user_id, channel_id):
-        return MCPResult(status=MCPResultStatus.SUCCESS, message="Done!")
+```
+etcd-awx-sync/
+├── etcd_to_awx.py           # CLI sync tool
+├── src/
+│   ├── agent.py             # Slack bot agent
+│   ├── llm_client.py        # LLM integration
+│   └── mcps/
+│       ├── base.py          # Base MCP class
+│       ├── registry.py      # MCP registry
+│       └── etcd_awx/
+│           └── mcp.py       # etcd-awx MCP
+├── k8s/
+│   ├── deployment.yaml      # K8s deployment
+│   ├── configmap.yaml       # Configuration
+│   └── deploy.sh            # Deploy script
+├── playbooks/
+│   └── sync_inventory.yml   # AWX playbook
+├── docs/
+│   └── AWX_SETUP.md         # AWX setup guide
+├── main.py                  # Bot entry point
+├── Dockerfile
+└── requirements.txt
 ```
 
-## Local Development
+---
 
-```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
+# Troubleshooting
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Run with mock LLM (no API key needed)
-export LLM_PROVIDER=mock
-export SLACK_BOT_TOKEN=xoxb-your-token
-export SLACK_APP_TOKEN=xapp-your-token
-python main.py
-```
-
-## Troubleshooting
-
-### ImagePullBackOff
+### ImagePullBackOff (K8s)
 - Check gcr-secret exists: `kubectl get secret gcr-secret`
-- Verify service account has `roles/storage.objectViewer` permission
-- Ensure image is built for correct architecture (linux/amd64)
+- Verify service account has `roles/storage.objectViewer`
+- Ensure image is built for linux/amd64
 
 ### 0 domains/hosts returned
-- Check etcd connectivity from pod
-- Verify ETCD_SERVER and ETCD_PORT in configmap
-- Check ETCD_PREFIX matches your etcd structure
+- Check etcd connectivity
+- Verify ETCD_SERVER and ETCD_PORT
+- Check ETCD_PREFIX matches your structure
 
-### Unhandled Slack events
-- These warnings are normal - the bot ignores channel_archive, member_joined, etc.
+### OAuth Token Error (AWX)
+- Ensure AWX OAuth app uses "Resource Owner Password-Based" grant type
+- Verify all 4 credentials are provided
+
+---
 
 ## License
 
