@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: agent
-          image: slack-mcp-agent:latest
+          image: gcr.io/unity-vivox-docker-registry/slack-mcp-agent:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

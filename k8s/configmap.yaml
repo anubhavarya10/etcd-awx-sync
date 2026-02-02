@@ -6,20 +6,16 @@ metadata:
     app: slack-mcp-agent
 data:
   # LLM Configuration
-  LLM_PROVIDER: "unity"
-  LLM_MODEL: "claude-3-sonnet"
+  LLM_PROVIDER: "mock"
 
-  # etcd Configuration
+  # etcd Configuration - update with your etcd server
   ETCD_SERVER: "etcd.default.svc.cluster.local"
   ETCD_PORT: "2379"
   ETCD_PREFIX: "/discovery/"
 
-  # AWX Configuration
+  # AWX Configuration - update with your AWX server
   AWX_SERVER: "awx.default.svc.cluster.local"
 
   # Application Configuration
   LOG_LEVEL: "INFO"
-  ETCD_AWX_SYNC_PATH: "/app/etcd-awx-sync"
-
-  # Python path
   PYTHONPATH: "/app:/app/etcd-awx-sync"

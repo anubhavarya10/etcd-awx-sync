@@ -112,8 +112,14 @@ class EtcdAwxMCP(BaseMCP):
 
         self.register_action(MCPAction(
             name="list-domains",
-            description="List all available domains/customers from etcd",
+            description="List all available domains/customers from etcd, optionally filtered by role",
             parameters=[
+                {
+                    "name": "role",
+                    "type": "string",
+                    "description": "Filter domains by role (e.g., 'mphpp', 'mim')",
+                    "required": False,
+                },
                 {
                     "name": "limit",
                     "type": "integer",
@@ -127,13 +133,21 @@ class EtcdAwxMCP(BaseMCP):
                 "show available domains",
                 "what domains are available",
                 "list customers",
+                "list domains for mphpp",
+                "which domains have mim servers",
             ],
         ))
 
         self.register_action(MCPAction(
             name="list-roles",
-            description="List all available roles from etcd",
+            description="List all available roles from etcd, optionally filtered by domain",
             parameters=[
+                {
+                    "name": "domain",
+                    "type": "string",
+                    "description": "Filter roles by domain (e.g., 'bnxp', 'pubwxp')",
+                    "required": False,
+                },
                 {
                     "name": "limit",
                     "type": "integer",
@@ -147,6 +161,9 @@ class EtcdAwxMCP(BaseMCP):
                 "show available roles",
                 "what roles are available",
                 "list server roles",
+                "list roles in bnxp",
+                "what roles does pubwxp have",
+                "show roles for valxp",
             ],
         ))
 
@@ -158,7 +175,34 @@ class EtcdAwxMCP(BaseMCP):
             examples=[
                 "status",
                 "show stats",
-                "how many hosts",
+            ],
+        ))
+
+        self.register_action(MCPAction(
+            name="count",
+            description="Count hosts by role and/or domain",
+            parameters=[
+                {"name": "role", "type": "string", "description": "Role to count", "required": False},
+                {"name": "domain", "type": "string", "description": "Domain to count", "required": False},
+            ],
+            requires_confirmation=False,
+            examples=[
+                "how many mphpp does bnxp have",
+                "how many hosts does lolxp have",
+                "count mim in caxp",
+            ],
+        ))
+
+        self.register_action(MCPAction(
+            name="count-domains",
+            description="Count how many domains have a specific role",
+            parameters=[
+                {"name": "role", "type": "string", "description": "Role to search for", "required": True},
+            ],
+            requires_confirmation=False,
+            examples=[
+                "how many domains have ngx",
+                "how many domains have srouter",
             ],
         ))
 
@@ -182,6 +226,10 @@ class EtcdAwxMCP(BaseMCP):
             return await self._handle_list_roles(parameters)
         elif action == "status":
             return await self._handle_status()
+        elif action == "count":
+            return await self._handle_count(parameters)
+        elif action == "count-domains":
+            return await self._handle_count_domains(parameters)
         else:
             return MCPResult(
                 status=MCPResultStatus.ERROR,
@@ -304,15 +352,24 @@ class EtcdAwxMCP(BaseMCP):
         await self._refresh_cache()
 
         limit = parameters.get("limit", 30)
+        role_filter = parameters.get("role")
         hosts = self._cache["hosts"]
         domains = self._cache["domains"]
 
-        # Count hosts per domain
+        # Count hosts per domain (optionally filtered by role)
         domain_counts = {}
+        total_filtered = 0
         for host_info in hosts.values():
             d = host_info.get("customer")
+            r = host_info.get("role")
+
+            # Apply role filter if specified
+            if role_filter and r and r.lower() != role_filter.lower():
+                continue
+
             if d:
                 domain_counts[d] = domain_counts.get(d, 0) + 1
+                total_filtered += 1
 
         # Sort by count
         sorted_domains = sorted(
@@ -320,14 +377,22 @@ class EtcdAwxMCP(BaseMCP):
             key=lambda x: -x[1]
         )[:limit]
 
-        lines = ["*Available Domains* (by host count)\n"]
+        if role_filter:
+            lines = [f"*Domains with `{role_filter}` servers* (by host count)\n"]
+        else:
+            lines = ["*Available Domains* (by host count)\n"]
+
         for domain, count in sorted_domains:
             lines.append(f"  `{domain}` - {count} hosts")
 
-        if len(domains) > limit:
-            lines.append(f"\n_...and {len(domains) - limit} more domains_")
+        filtered_domain_count = len(domain_counts)
+        if filtered_domain_count > limit:
+            lines.append(f"\n_...and {filtered_domain_count - limit} more domains_")
 
-        lines.append(f"\n*Total:* {len(domains)} domains, {len(hosts)} hosts")
+        if role_filter:
+            lines.append(f"\n*Total:* {filtered_domain_count} domains with `{role_filter}`, {total_filtered} hosts")
+        else:
+            lines.append(f"\n*Total:* {len(domains)} domains, {len(hosts)} hosts")
 
         return MCPResult(
             status=MCPResultStatus.SUCCESS,
@@ -339,15 +404,24 @@ class EtcdAwxMCP(BaseMCP):
         await self._refresh_cache()
 
         limit = parameters.get("limit")
+        domain_filter = parameters.get("domain")
         hosts = self._cache["hosts"]
         roles = self._cache["roles"]
 
-        # Count hosts per role
+        # Count hosts per role (optionally filtered by domain)
         role_counts = {}
+        total_filtered = 0
         for host_info in hosts.values():
             r = host_info.get("role")
+            d = host_info.get("customer")
+
+            # Apply domain filter if specified
+            if domain_filter and d and d.lower() != domain_filter.lower():
+                continue
+
             if r:
                 role_counts[r] = role_counts.get(r, 0) + 1
+                total_filtered += 1
 
         # Sort by count
         sorted_roles = sorted(
@@ -358,11 +432,19 @@ class EtcdAwxMCP(BaseMCP):
         if limit:
             sorted_roles = sorted_roles[:limit]
 
-        lines = ["*Available Roles* (by host count)\n"]
+        if domain_filter:
+            lines = [f"*Roles in `{domain_filter}` domain* (by host count)\n"]
+        else:
+            lines = ["*Available Roles* (by host count)\n"]
+
         for role, count in sorted_roles:
             lines.append(f"  `{role}` - {count} hosts")
 
-        lines.append(f"\n*Total:* {len(roles)} roles")
+        filtered_role_count = len(role_counts)
+        if domain_filter:
+            lines.append(f"\n*Total:* {filtered_role_count} roles in `{domain_filter}`, {total_filtered} hosts")
+        else:
+            lines.append(f"\n*Total:* {len(roles)} roles")
 
         return MCPResult(
             status=MCPResultStatus.SUCCESS,
@@ -401,6 +483,83 @@ class EtcdAwxMCP(BaseMCP):
         return MCPResult(
             status=MCPResultStatus.SUCCESS,
             message=message,
+        )
+
+    async def _handle_count(self, parameters: Dict[str, Any]) -> MCPResult:
+        """Handle count hosts action."""
+        await self._refresh_cache()
+
+        role_filter = parameters.get("role")
+        domain_filter = parameters.get("domain")
+        hosts = self._cache["hosts"]
+
+        # Count matching hosts
+        count = 0
+        for host_info in hosts.values():
+            r = host_info.get("role")
+            d = host_info.get("customer")
+
+            # Apply filters
+            if role_filter and r and r.lower() != role_filter.lower():
+                continue
+            if domain_filter and d and d.lower() != domain_filter.lower():
+                continue
+
+            count += 1
+
+        # Build response message
+        if role_filter and domain_filter:
+            message = f"*{count}* `{role_filter}` hosts in `{domain_filter}`"
+        elif domain_filter:
+            message = f"*{count}* total hosts in `{domain_filter}`"
+        elif role_filter:
+            message = f"*{count}* `{role_filter}` hosts across all domains"
+        else:
+            message = f"*{count}* total hosts"
+
+        return MCPResult(
+            status=MCPResultStatus.SUCCESS,
+            message=message,
+            data={"count": count, "role": role_filter, "domain": domain_filter},
+        )
+
+    async def _handle_count_domains(self, parameters: Dict[str, Any]) -> MCPResult:
+        """Handle count domains with role action."""
+        await self._refresh_cache()
+
+        role_filter = parameters.get("role")
+        if not role_filter:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message="Role is required for counting domains",
+            )
+
+        hosts = self._cache["hosts"]
+
+        # Find domains that have this role
+        domains_with_role = set()
+        for host_info in hosts.values():
+            r = host_info.get("role")
+            d = host_info.get("customer")
+
+            if r and r.lower() == role_filter.lower() and d:
+                domains_with_role.add(d)
+
+        count = len(domains_with_role)
+
+        # List first few domains
+        domain_list = sorted(domains_with_role)[:10]
+        if len(domains_with_role) > 10:
+            domain_preview = ", ".join(f"`{d}`" for d in domain_list) + f"... and {len(domains_with_role) - 10} more"
+        else:
+            domain_preview = ", ".join(f"`{d}`" for d in domain_list) if domain_list else "none"
+
+        message = f"*{count}* domains have `{role_filter}` servers\n\nDomains: {domain_preview}"
+
+        return MCPResult(
+            status=MCPResultStatus.SUCCESS,
+            message=message,
+            data={"count": count, "role": role_filter, "domains": list(domains_with_role)},
         )
 
     async def _execute_confirmed(
@@ -562,16 +721,61 @@ class EtcdAwxMCP(BaseMCP):
     def _fetch_from_etcd(self) -> Tuple[Dict, Set[str], Set[str]]:
         """Fetch data from etcd (runs in thread pool)."""
         try:
-            import sys
-            etcd_awx_path = os.environ.get("ETCD_AWX_SYNC_PATH", "/app/etcd-awx-sync")
-            if etcd_awx_path not in sys.path:
-                sys.path.insert(0, etcd_awx_path)
+            import etcd3
 
-            from etcd_to_awx import get_hosts_from_etcd
-            return get_hosts_from_etcd()
+            client = etcd3.client(
+                host=self.etcd_server,
+                port=self.etcd_port,
+            )
+
+            hosts = {}
+            domains = set()
+            roles = set()
+
+            # Fetch all keys under /discovery/
+            prefix = os.environ.get("ETCD_PREFIX", "/discovery/")
+
+            for value, metadata in client.get_prefix(prefix):
+                if metadata is None:
+                    continue
+
+                key = metadata.key.decode('utf-8') if isinstance(metadata.key, bytes) else metadata.key
+
+                # Extract hostname from key (e.g., /discovery/mphhos-aptus2-010103-1.vivox.com)
+                hostname = key.replace(prefix, "").strip("/")
+                if not hostname or "." not in hostname:
+                    continue
+
+                # Parse hostname: <role>-<domain>-<numbers>-<index>.vivox.com
+                # Examples:
+                #   mphhos-aptus2-010103-1.vivox.com -> role=mphhos, domain=aptus2
+                #   mim-aptus2-010103-1.vivox.com -> role=mim, domain=aptus2
+                #   ngx-dcuxp-010103-1.vivox.com -> role=ngx, domain=dcuxp
+
+                short_name = hostname.split(".")[0]  # Remove .vivox.com
+                parts = short_name.split("-")
+
+                if len(parts) >= 2:
+                    role = parts[0]
+                    domain = parts[1]
+
+                    roles.add(role)
+                    domains.add(domain)
+
+                    hosts[hostname] = {
+                        "hostname": hostname,
+                        "role": role,
+                        "customer": domain,  # 'customer' for backward compatibility
+                        "domain": domain,
+                    }
+
+            client.close()
+            return hosts, domains, roles
 
         except Exception as e:
             logger.error(f"Error fetching from etcd: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {}, set(), set()
 
     def _count_matching_hosts(

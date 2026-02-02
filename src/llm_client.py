@@ -278,22 +278,36 @@ class MockLLMClient(BaseLLMClient):
         """Return a mock response based on keywords."""
         user_lower = user_message.lower()
 
-        # Simple keyword matching for testing
-        if "sync" in user_lower and ("inventory" in user_lower or "etcd" in user_lower or "awx" in user_lower):
-            if "mphpp" in user_lower or "role" in user_lower:
-                role = "mphpp"
-                for word in user_lower.split():
-                    if word in ["mphpp", "mim", "ts", "www", "mphhos"]:
-                        role = word
-                        break
+        # Status command
+        if "status" in user_lower:
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "etcd-awx-sync",
+                    "action": "status",
+                    "parameters": {},
+                    "confidence": 0.95,
+                    "explanation": "User wants to see status"
+                }),
+                model="mock",
+            )
 
-                domain = None
-                for word in user_lower.split():
-                    if "xp" in word:
-                        domain = word
-                        break
+        # Create inventory with role/domain
+        if "create" in user_lower or ("for" in user_lower and "xp" in user_lower):
+            role = None
+            domain = None
 
-                params = {"role": role}
+            # Known roles
+            known_roles = ["mphpp", "mim", "ts", "www", "mphhos", "hamim", "os", "db", "web"]
+            for word in user_lower.replace(",", " ").split():
+                if word in known_roles:
+                    role = word
+                if "xp" in word:
+                    domain = word
+
+            if role or domain:
+                params = {}
+                if role:
+                    params["role"] = role
                 if domain:
                     params["domain"] = domain
 
@@ -303,11 +317,13 @@ class MockLLMClient(BaseLLMClient):
                         "action": "create",
                         "parameters": params,
                         "confidence": 0.9,
-                        "explanation": f"User wants to create inventory for role {role}"
+                        "explanation": f"User wants to create inventory"
                     }),
                     model="mock",
                 )
 
+        # Full sync
+        if "sync" in user_lower:
             return LLMResponse(
                 content=json.dumps({
                     "mcp_name": "etcd-awx-sync",
@@ -319,24 +335,90 @@ class MockLLMClient(BaseLLMClient):
                 model="mock",
             )
 
+        # Handle "how many" questions
+        if "how many" in user_lower:
+            words = user_lower.replace(",", " ").replace("?", "").split()
+            known_roles = ["mphpp", "mim", "ts", "www", "mphhos", "hamim", "os", "db", "web", "ngx", "mimmem", "haproxy", "redis", "srouter"]
+
+            role = None
+            domain = None
+            for word in words:
+                if word in known_roles:
+                    role = word
+                if word.endswith("xp") or word.endswith("xs") or (word.endswith("p") and len(word) > 3 and word not in ["help"]):
+                    domain = word
+
+            # "how many mphpp does bnxp have" -> count role in domain
+            if role and domain:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "etcd-awx-sync",
+                        "action": "count",
+                        "parameters": {"role": role, "domain": domain},
+                        "confidence": 0.95,
+                        "explanation": f"Count {role} servers in {domain}"
+                    }),
+                    model="mock",
+                )
+
+            # "how many hosts does lolxp have" -> total hosts in domain
+            if domain and ("host" in user_lower or "server" in user_lower or "total" in user_lower):
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "etcd-awx-sync",
+                        "action": "count",
+                        "parameters": {"domain": domain},
+                        "confidence": 0.95,
+                        "explanation": f"Count total hosts in {domain}"
+                    }),
+                    model="mock",
+                )
+
+            # "how many domains have ngx" -> count domains with role
+            if role and ("domain" in user_lower):
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "etcd-awx-sync",
+                        "action": "count-domains",
+                        "parameters": {"role": role},
+                        "confidence": 0.95,
+                        "explanation": f"Count domains with {role}"
+                    }),
+                    model="mock",
+                )
+
         if "list" in user_lower and "domain" in user_lower:
+            params = {}
+            words = user_lower.replace(",", " ").split()
+            known_roles = ["mphpp", "mim", "ts", "www", "mphhos", "hamim", "os", "db", "web", "ngx", "mimmem", "haproxy", "redis", "srouter"]
+            for word in words:
+                if word in known_roles:
+                    params["role"] = word
+                    break
             return LLMResponse(
                 content=json.dumps({
                     "mcp_name": "etcd-awx-sync",
                     "action": "list-domains",
-                    "parameters": {},
+                    "parameters": params,
                     "confidence": 0.95,
                     "explanation": "User wants to list available domains"
                 }),
                 model="mock",
             )
 
-        if "list" in user_lower and "role" in user_lower:
+        if ("list" in user_lower and "role" in user_lower) or ("roles" in user_lower and ("in" in user_lower or "for" in user_lower or "does" in user_lower or "have" in user_lower)):
+            params = {}
+            words = user_lower.replace(",", " ").split()
+            for word in words:
+                if word.endswith("xp") or word.endswith("xs") or (word.endswith("p") and len(word) > 3):
+                    if word not in ["help", "xp"]:
+                        params["domain"] = word
+                        break
             return LLMResponse(
                 content=json.dumps({
                     "mcp_name": "etcd-awx-sync",
                     "action": "list-roles",
-                    "parameters": {},
+                    "parameters": params,
                     "confidence": 0.95,
                     "explanation": "User wants to list available roles"
                 }),

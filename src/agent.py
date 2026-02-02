@@ -1,6 +1,7 @@
 """Main Slack Agent that orchestrates MCPs using LLM for intent parsing."""
 
 import os
+import re
 import asyncio
 import logging
 from typing import Optional, Dict, Any, List
@@ -69,26 +70,51 @@ class SlackMCPAgent:
         async def handle_agent_command(ack, command, client, respond):
             """Handle /agent slash command."""
             await ack()
-            await self._process_message(
-                text=command.get("text", ""),
-                user_id=command.get("user_id"),
-                channel_id=command.get("channel_id"),
-                client=client,
-                respond=respond,
-            )
+            text = command.get("text", "")
+            channel_id = command.get("channel_id")
+            user_id = command.get("user_id")
+            logger.info(f"Received /agent command: '{text}' from user {user_id}")
+
+            # Create a public responder that posts to channel
+            async def public_respond(**kwargs):
+                kwargs["channel"] = channel_id
+                if "text" not in kwargs:
+                    kwargs["text"] = "Response"
+                await client.chat_postMessage(**kwargs)
+
+            try:
+                await self._process_message(
+                    text=text,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    client=client,
+                    respond=public_respond,
+                )
+            except Exception as e:
+                logger.exception(f"Error handling /agent command: {e}")
+                await client.chat_postMessage(channel=channel_id, text=f"Error: {str(e)}")
 
         @self.app.command("/inventory")
         async def handle_inventory_command(ack, command, client, respond):
             """Handle /inventory slash command (backward compatible)."""
             await ack()
-            # Prefix with context for LLM
             text = command.get("text", "")
+            channel_id = command.get("channel_id")
+            user_id = command.get("user_id")
+
+            # Create a public responder that posts to channel
+            async def public_respond(**kwargs):
+                kwargs["channel"] = channel_id
+                if "text" not in kwargs:
+                    kwargs["text"] = "Response"
+                await client.chat_postMessage(**kwargs)
+
             await self._process_message(
                 text=f"inventory {text}" if text else "inventory help",
-                user_id=command.get("user_id"),
-                channel_id=command.get("channel_id"),
+                user_id=user_id,
+                channel_id=channel_id,
                 client=client,
-                respond=respond,
+                respond=public_respond,
             )
 
         @self.app.event("app_mention")
@@ -126,7 +152,7 @@ class SlackMCPAgent:
                     respond=say,
                 )
 
-        @self.app.action({"action_id": "confirm_.*"})
+        @self.app.action(re.compile(r"confirm_.*"))
         async def handle_confirm(ack, action, body, client, respond):
             """Handle confirmation button clicks."""
             await ack()
@@ -141,7 +167,7 @@ class SlackMCPAgent:
 
             await self._send_result(result, respond, client, body.get("channel", {}).get("id"))
 
-        @self.app.action({"action_id": "cancel_.*"})
+        @self.app.action(re.compile(r"cancel_.*"))
         async def handle_cancel(ack, action, body, client, respond):
             """Handle cancel button clicks."""
             await ack()
@@ -155,6 +181,20 @@ class SlackMCPAgent:
             )
 
             await respond(text="Action cancelled.")
+
+        # Catch-all for events we don't need to handle (suppress warnings)
+        @self.app.event("channel_archive")
+        @self.app.event("channel_unarchive")
+        @self.app.event("channel_created")
+        @self.app.event("channel_deleted")
+        @self.app.event("channel_rename")
+        @self.app.event("member_joined_channel")
+        @self.app.event("member_left_channel")
+        @self.app.event("user_change")
+        @self.app.event("team_join")
+        async def handle_ignored_events(event, logger):
+            """Silently ignore these events."""
+            pass
 
     async def _process_message(
         self,
