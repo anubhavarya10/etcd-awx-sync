@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Callable
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MCPResultStatus(Enum):
@@ -187,13 +190,17 @@ Available Actions:
         Returns:
             MCPResult with final operation outcome
         """
+        logger.info(f"Looking for action_id={action_id} in pending={list(self._pending_confirmations.keys())}")
+
         if action_id not in self._pending_confirmations:
+            logger.warning(f"action_id={action_id} NOT FOUND in pending confirmations")
             return MCPResult(
                 status=MCPResultStatus.ERROR,
                 message="This action has expired or was already processed."
             )
 
         pending = self._pending_confirmations.pop(action_id)
+        logger.info(f"Found pending action: {pending['action']} with params {pending['parameters']}")
 
         if not confirmed:
             return MCPResult(
@@ -252,6 +259,7 @@ Available Actions:
             "user_id": user_id,
             "channel_id": channel_id,
         }
+        logger.info(f"Created confirmation: action_id={action_id}, action={action}, params={parameters}")
 
         # Create Slack Block Kit confirmation buttons
         blocks = [

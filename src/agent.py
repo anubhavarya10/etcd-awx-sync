@@ -159,11 +159,15 @@ class SlackMCPAgent:
             action_id = action.get("value")
             user_id = body.get("user", {}).get("id")
 
+            logger.info(f"Confirm button clicked: action_id={action_id}, user={user_id}")
+
             result = await self.registry.handle_confirmation(
                 action_id=action_id,
                 confirmed=True,
                 user_id=user_id,
             )
+
+            logger.info(f"Confirmation result: status={result.status}, message={result.message[:50]}")
 
             await self._send_result(result, respond, client, body.get("channel", {}).get("id"))
 
@@ -266,8 +270,11 @@ class SlackMCPAgent:
         channel_id: str,
     ):
         """Send an MCP result back to Slack."""
+        logger.info(f"Sending result: status={result.status}, action_id={result.action_id}")
+
         if result.status == MCPResultStatus.NEEDS_CONFIRMATION:
             # Send confirmation prompt with buttons
+            logger.info(f"Sending confirmation with action_id={result.action_id}")
             if result.blocks:
                 await respond(text=result.message, blocks=result.blocks)
             else:

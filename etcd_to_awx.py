@@ -954,5 +954,81 @@ def main():
     print("=" * 60)
 
 
+def run_sync(
+    domain_filter: str = None,
+    role_filter: str = None,
+    inventory_name: str = None,
+) -> Dict[str, Any]:
+    """
+    Run sync programmatically (called by Slack MCP agent).
+
+    Args:
+        domain_filter: Filter by domain/customer
+        role_filter: Filter by role
+        inventory_name: Custom inventory name
+
+    Returns:
+        Dict with sync results
+    """
+    import time
+    start_time = time.time()
+
+    check_required_env_vars()
+
+    # Get hosts from etcd
+    all_hosts, all_domains, all_roles = get_hosts_from_etcd()
+
+    if not all_hosts:
+        raise Exception("No hosts found in etcd")
+
+    # Build inventory name if not provided
+    if not inventory_name:
+        if role_filter and domain_filter:
+            inventory_name = f"{role_filter}-{domain_filter}"
+        elif role_filter:
+            inventory_name = f"{role_filter}-all-domains"
+        elif domain_filter:
+            inventory_name = f"{domain_filter}-inventory"
+        else:
+            inventory_name = "central inventory"
+
+    # Apply filters
+    if domain_filter or role_filter:
+        hosts = filter_hosts(all_hosts, domain_filter, role_filter)
+        if not hosts:
+            raise Exception(f"No hosts match filters: domain={domain_filter}, role={role_filter}")
+    else:
+        hosts = all_hosts
+
+    # Create AWX session and sync
+    session = create_awx_session()
+
+    # Verify connection
+    response = session.get(f"{get_awx_api_url()}/ping/")
+    response.raise_for_status()
+
+    # Get organization
+    org_id = get_or_create_organization(session)
+
+    # Create inventory
+    inventory_id = create_inventory(session, org_id, inventory_name)
+
+    # Add hosts
+    host_id_map = add_hosts_to_inventory(session, inventory_id, hosts)
+
+    # Create groups
+    group_members = create_groups_and_assign_hosts(session, inventory_id, hosts, host_id_map)
+
+    duration = time.time() - start_time
+
+    return {
+        "inventory_name": inventory_name,
+        "inventory_id": inventory_id,
+        "host_count": len(host_id_map),
+        "group_count": len(group_members),
+        "duration_seconds": duration,
+    }
+
+
 if __name__ == "__main__":
     main()
