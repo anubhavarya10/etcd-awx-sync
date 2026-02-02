@@ -741,27 +741,33 @@ class EtcdAwxMCP(BaseMCP):
 
                 key = metadata.key.decode('utf-8') if isinstance(metadata.key, bytes) else metadata.key
 
-                # Extract hostname from key (e.g., /discovery/mphhos-aptus2-010103-1.vivox.com)
-                hostname = key.replace(prefix, "").strip("/")
+                # Key structure: /discovery/<customer>/<role>/<hostname>/<key_type>
+                # Example: /discovery/bnxp/mphpp/mphpp-bnxp-010103-1-3f6e3aa25b3e56e4.vivox.com/version_morpheus
+                parts = key.split("/")
+
+                # parts[0] = "" (before first /)
+                # parts[1] = "discovery"
+                # parts[2] = customer/domain (e.g., "bnxp")
+                # parts[3] = role (e.g., "mphpp")
+                # parts[4] = hostname (e.g., "mphpp-bnxp-010103-1-3f6e3aa25b3e56e4.vivox.com")
+                # parts[5] = key_type (e.g., "version_morpheus", "viv_privip")
+
+                if len(parts) < 5:
+                    continue
+
+                domain = parts[2]
+                role = parts[3]
+                hostname = parts[4]
+
+                # Skip if hostname doesn't look valid
                 if not hostname or "." not in hostname:
                     continue
 
-                # Parse hostname: <role>-<domain>-<numbers>-<index>.vivox.com
-                # Examples:
-                #   mphhos-aptus2-010103-1.vivox.com -> role=mphhos, domain=aptus2
-                #   mim-aptus2-010103-1.vivox.com -> role=mim, domain=aptus2
-                #   ngx-dcuxp-010103-1.vivox.com -> role=ngx, domain=dcuxp
+                roles.add(role)
+                domains.add(domain)
 
-                short_name = hostname.split(".")[0]  # Remove .vivox.com
-                parts = short_name.split("-")
-
-                if len(parts) >= 2:
-                    role = parts[0]
-                    domain = parts[1]
-
-                    roles.add(role)
-                    domains.add(domain)
-
+                # Only add each hostname once (there are multiple keys per host)
+                if hostname not in hosts:
                     hosts[hostname] = {
                         "hostname": hostname,
                         "role": role,
