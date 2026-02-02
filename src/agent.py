@@ -223,7 +223,7 @@ class SlackMCPAgent:
 
         # Use LLM to parse intent
         try:
-            await respond(text="Thinking...")
+            await respond(text=f"*Query:* `{text}`\n_Processing..._")
 
             mcp_context = self.registry.get_llm_context()
             intent = await self.llm_client.parse_intent(
@@ -232,12 +232,13 @@ class SlackMCPAgent:
             )
 
             logger.info(f"Parsed intent: mcp={intent.mcp_name}, action={intent.action}, "
-                       f"confidence={intent.confidence}")
+                       f"params={intent.parameters}, confidence={intent.confidence}")
 
             # Handle unknown intent
             if intent.mcp_name == "unknown" or intent.confidence < 0.5:
                 await respond(
-                    text=f"I'm not sure what you want to do. {intent.explanation}\n\n"
+                    text=f"*Query:* `{text}`\n\n"
+                         f"I'm not sure what you want to do. {intent.explanation}\n\n"
                          f"Try asking for `help` or be more specific."
                 )
                 return
