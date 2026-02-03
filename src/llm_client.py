@@ -294,6 +294,124 @@ class MockLLMClient(BaseLLMClient):
         # Extract potential role/domain - any word that's not a common word
         potential_terms = [w for w in words if w not in skip_words and len(w) >= 2]
 
+        # === PLAYBOOK COMMANDS ===
+
+        # List playbooks
+        if ("list" in user_lower or "show" in user_lower) and "playbook" in user_lower:
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "awx-playbook",
+                    "action": "list-playbooks",
+                    "parameters": {},
+                    "confidence": 0.95,
+                    "explanation": "User wants to list available playbooks"
+                }),
+                model="mock",
+            )
+
+        # List jobs
+        if ("list" in user_lower or "show" in user_lower) and "job" in user_lower:
+            params = {}
+            if potential_terms:
+                params["inventory"] = potential_terms[0]
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "awx-playbook",
+                    "action": "list-jobs",
+                    "parameters": params,
+                    "confidence": 0.95,
+                    "explanation": "User wants to list recent jobs"
+                }),
+                model="mock",
+            )
+
+        # Job status - "job status 123" or "status of job 123"
+        if "job" in user_lower and ("status" in user_lower or "check" in user_lower):
+            # Look for a job ID (numeric)
+            job_id = None
+            for term in potential_terms:
+                if term.isdigit():
+                    job_id = term
+                    break
+            if job_id:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "awx-playbook",
+                        "action": "job-status",
+                        "parameters": {"job_id": job_id},
+                        "confidence": 0.95,
+                        "explanation": f"Check status of job {job_id}"
+                    }),
+                    model="mock",
+                )
+
+        # Job output - "job output 123" or "show output of job 123"
+        if "job" in user_lower and ("output" in user_lower or "log" in user_lower or "result" in user_lower):
+            job_id = None
+            for term in potential_terms:
+                if term.isdigit():
+                    job_id = term
+                    break
+            if job_id:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "awx-playbook",
+                        "action": "job-output",
+                        "parameters": {"job_id": job_id},
+                        "confidence": 0.95,
+                        "explanation": f"Get output of job {job_id}"
+                    }),
+                    model="mock",
+                )
+
+        # Run playbook - "run <playbook> on <inventory>"
+        if "run" in user_lower and ("playbook" in user_lower or ".yml" in user_lower or ".yaml" in user_lower):
+            params = {}
+            # Look for playbook name (contains .yml or .yaml, or term after "run")
+            playbook_name = None
+            inventory_name = None
+
+            # Find terms - playbook is usually before "on", inventory after
+            on_idx = words.index("on") if "on" in words else None
+
+            for term in potential_terms:
+                if ".yml" in term or ".yaml" in term:
+                    playbook_name = term
+                    break
+
+            # If no .yml found, look for term after "run"
+            if not playbook_name:
+                run_idx = words.index("run") if "run" in words else None
+                if run_idx is not None and run_idx + 1 < len(words):
+                    next_term = words[run_idx + 1]
+                    if next_term not in skip_words and next_term != "playbook":
+                        playbook_name = next_term
+
+            # Find inventory (term after "on")
+            if on_idx is not None:
+                terms_after_on = [w for w in words[on_idx+1:] if w in potential_terms or "-" in w]
+                if terms_after_on:
+                    inventory_name = terms_after_on[0]
+
+            if playbook_name:
+                params["playbook"] = playbook_name
+            if inventory_name:
+                params["inventory"] = inventory_name
+
+            if params:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "awx-playbook",
+                        "action": "run-playbook",
+                        "parameters": params,
+                        "confidence": 0.9,
+                        "explanation": f"Run playbook: {params}"
+                    }),
+                    model="mock",
+                )
+
+        # === INVENTORY COMMANDS ===
+
         # Status command
         if "status" in user_lower:
             return LLMResponse(
@@ -430,24 +548,86 @@ class MockLLMClient(BaseLLMClient):
                 model="mock",
             )
 
-        # Create inventory
-        if "create" in user_lower or ("for" in user_lower and potential_terms):
+        # Update inventory - handle "update" or "refresh" commands
+        if "update" in user_lower or "refresh" in user_lower:
             params = {}
+
+            # Extract inventory name or role/domain from potential terms
             if len(potential_terms) >= 2:
+                # Could be "update mim-nwxp" or "update mim for nwxp"
+                # Check if first term contains a dash (inventory name)
+                if "-" in potential_terms[0]:
+                    params["inventory_name"] = potential_terms[0]
+                else:
+                    params["role"] = potential_terms[0]
+                    params["domain"] = potential_terms[1]
+            elif len(potential_terms) == 1:
+                # Single term - could be inventory name or role
+                if "-" in potential_terms[0]:
+                    params["inventory_name"] = potential_terms[0]
+                else:
+                    params["role"] = potential_terms[0]
+
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "etcd-awx-sync",
+                    "action": "update",
+                    "parameters": params,
+                    "confidence": 0.9,
+                    "explanation": f"Update inventory: {params}"
+                }),
+                model="mock",
+            )
+
+        # Create inventory - handle "X for Y" pattern explicitly
+        # Pattern: "mphpp for mt1s" or "create inventory for mphpp in mt1s"
+        if "for" in words or "in" in words or "create" in user_lower:
+            params = {}
+
+            # Find the position of "for" or "in" to split role and domain
+            for_idx = None
+            in_idx = None
+            if "for" in words:
+                for_idx = words.index("for")
+            if "in" in words:
+                in_idx = words.index("in")
+
+            # Use the first occurrence of "for" or "in" as separator
+            sep_idx = for_idx if for_idx is not None else in_idx
+
+            if sep_idx is not None and len(potential_terms) >= 2:
+                # Get terms before and after separator
+                terms_before_sep = [w for w in words[:sep_idx] if w in potential_terms]
+                terms_after_sep = [w for w in words[sep_idx+1:] if w in potential_terms]
+
+                if terms_before_sep and terms_after_sep:
+                    params["role"] = terms_before_sep[-1]  # Last term before separator is role
+                    params["domain"] = terms_after_sep[0]   # First term after separator is domain
+                elif terms_before_sep:
+                    params["role"] = terms_before_sep[-1]
+                elif terms_after_sep:
+                    # If only terms after, could be "create inventory for mphpp"
+                    if len(terms_after_sep) >= 2:
+                        params["role"] = terms_after_sep[0]
+                        params["domain"] = terms_after_sep[1]
+                    else:
+                        params["role"] = terms_after_sep[0]
+            elif len(potential_terms) >= 2:
+                # Fallback: first term is role, second is domain
                 params["role"] = potential_terms[0]
                 params["domain"] = potential_terms[1]
             elif len(potential_terms) == 1:
-                # Single term - could be role or domain
                 params["role"] = potential_terms[0]
 
             if params:
+                explanation = f"Create inventory: role={params.get('role', 'all')}, domain={params.get('domain', 'all')}"
                 return LLMResponse(
                     content=json.dumps({
                         "mcp_name": "etcd-awx-sync",
                         "action": "create",
                         "parameters": params,
                         "confidence": 0.9,
-                        "explanation": "User wants to create inventory"
+                        "explanation": explanation
                     }),
                     model="mock",
                 )

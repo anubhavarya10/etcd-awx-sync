@@ -154,37 +154,18 @@ class SlackMCPAgent:
 
         @self.app.action(re.compile(r"confirm_.*"))
         async def handle_confirm(ack, action, body, client, respond):
-            """Handle confirmation button clicks."""
+            """Handle confirmation button clicks - silently ignore old buttons."""
             await ack()
-            action_id = action.get("value")
-            user_id = body.get("user", {}).get("id")
-
-            logger.info(f"Confirm button clicked: action_id={action_id}, user={user_id}")
-
-            result = await self.registry.handle_confirmation(
-                action_id=action_id,
-                confirmed=True,
-                user_id=user_id,
-            )
-
-            logger.info(f"Confirmation result: status={result.status}, message={result.message[:50]}")
-
-            await self._send_result(result, respond, client, body.get("channel", {}).get("id"))
+            # Don't respond at all - just silently acknowledge
+            # This prevents confusing "expired" messages from appearing
+            logger.debug(f"Ignored old confirm button: {action.get('value')}")
 
         @self.app.action(re.compile(r"cancel_.*"))
         async def handle_cancel(ack, action, body, client, respond):
-            """Handle cancel button clicks."""
+            """Handle cancel button clicks - silently ignore old buttons."""
             await ack()
-            action_id = action.get("value")
-            user_id = body.get("user", {}).get("id")
-
-            result = await self.registry.handle_confirmation(
-                action_id=action_id,
-                confirmed=False,
-                user_id=user_id,
-            )
-
-            await respond(text="Action cancelled.")
+            # Don't respond at all - just silently acknowledge
+            logger.debug(f"Ignored old cancel button: {action.get('value')}")
 
         # Catch-all for events we don't need to handle (suppress warnings)
         @self.app.event("channel_archive")
@@ -227,8 +208,6 @@ class SlackMCPAgent:
 
         # Use LLM to parse intent
         try:
-            await respond(text=f"*Query:* `{text}`\n_Processing..._")
-
             mcp_context = self.registry.get_llm_context()
             intent = await self.llm_client.parse_intent(
                 user_message=text,
@@ -238,14 +217,36 @@ class SlackMCPAgent:
             logger.info(f"Parsed intent: mcp={intent.mcp_name}, action={intent.action}, "
                        f"params={intent.parameters}, confidence={intent.confidence}")
 
+            # Build parsed info for display
+            parsed_info = []
+            if intent.parameters.get("role"):
+                parsed_info.append(f"Role: `{intent.parameters['role']}`")
+            if intent.parameters.get("domain"):
+                parsed_info.append(f"Domain: `{intent.parameters['domain']}`")
+            parsed_str = " | ".join(parsed_info) if parsed_info else "_no filters_"
+
             # Handle unknown intent
             if intent.mcp_name == "unknown" or intent.confidence < 0.5:
                 await respond(
-                    text=f"*Query:* `{text}`\n\n"
+                    text=f"*Query:* `{text}`\n"
+                         f"*Parsed:* {parsed_str}\n\n"
                          f"I'm not sure what you want to do. {intent.explanation}\n\n"
                          f"Try asking for `help` or be more specific."
                 )
                 return
+
+            # Generate a short task ID for tracking
+            import random
+            import string
+            task_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+
+            # Show what we understood with task ID
+            await respond(
+                text=f"📋 *Task `{task_id}`*\n"
+                     f"*Query:* `{text}`\n"
+                     f"*Action:* `{intent.action}` | {parsed_str}\n"
+                     f"⏳ _Processing... (timeout: 5 min)_"
+            )
 
             # Route to MCP
             result = await self.registry.route_action(

@@ -8,13 +8,19 @@ data:
   # LLM Configuration
   LLM_PROVIDER: "mock"
 
-  # etcd Configuration - update with your etcd server
-  ETCD_SERVER: "etcd.default.svc.cluster.local"
+  # etcd Configuration
+  ETCD_SERVER: "10.0.25.44"
   ETCD_PORT: "2379"
   ETCD_PREFIX: "/discovery/"
 
-  # AWX Configuration - update with your AWX server
-  AWX_SERVER: "awx.default.svc.cluster.local"
+  # AWX Configuration
+  AWX_SERVER: "10.0.74.5"
+
+  # GitHub Configuration for Playbooks
+  GITHUB_API_URL: "https://github.cds.internal.unity3d.com/api/v3"
+  GITHUB_PLAYBOOKS_REPO: "unity/vivox-ops-docker"
+  GITHUB_PLAYBOOKS_PATH: "ansible"
+  GITHUB_PLAYBOOKS_BRANCH: "main"
 
   # Application Configuration
   LOG_LEVEL: "INFO"

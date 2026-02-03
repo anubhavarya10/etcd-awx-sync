@@ -14,6 +14,8 @@ spec:
       labels:
         app: slack-mcp-agent
     spec:
+      imagePullSecrets:
+        - name: gcr-secret
       containers:
         - name: agent
           image: us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/slack-mcp-agent:latest

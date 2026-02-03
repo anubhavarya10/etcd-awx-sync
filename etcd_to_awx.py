@@ -88,7 +88,10 @@ def create_awx_session() -> requests.Session:
         if response.status_code != 200:
             print(f"OAuth token request failed: {response.status_code}")
             print(f"Response: {response.text}")
-            raise Exception("Failed to obtain OAuth token")
+            # Fall back to Basic Auth if OAuth fails
+            print("Falling back to Basic Authentication...")
+            session.auth = (AWX_USERNAME, AWX_PASSWORD)
+            return session
         token = response.json().get("access_token")
         print("Successfully obtained OAuth token")
         session.headers.update({'Authorization': f'Bearer {token}'})
@@ -219,26 +222,31 @@ def filter_hosts(
     role_filter: Optional[str] = None
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Filter hosts by domain and/or role.
+    Filter hosts by domain and/or role using EXACT MATCHING.
 
     Args:
         hosts: Dictionary of all hosts
-        domain_filter: Filter by domain/customer (e.g., 'pubwxp')
-        role_filter: Filter by role (e.g., 'mphpp')
+        domain_filter: Filter by domain/customer (e.g., 'pubwxp') - EXACT MATCH
+        role_filter: Filter by role (e.g., 'mphpp') - EXACT MATCH
 
     Returns:
         Filtered dictionary of hosts
+
+    Note:
+        Uses exact matching to prevent 'rfxp' from matching 'wrfxp'.
+        This is critical for production safety.
     """
     filtered = {}
 
     for hostname, info in hosts.items():
-        # Check domain filter
+        # Check domain filter - EXACT MATCH ONLY
         if domain_filter:
             host_domain = info.get('customer', '').lower()
-            if domain_filter.lower() not in host_domain and host_domain != domain_filter.lower():
-                # Also check if domain is in hostname
-                if domain_filter.lower() not in hostname.lower():
-                    continue
+            domain_filter_lower = domain_filter.lower()
+
+            # Exact domain match only (rfxp != wrfxp)
+            if host_domain != domain_filter_lower:
+                continue
 
         # Check role filter - EXACT MATCH ONLY
         if role_filter:

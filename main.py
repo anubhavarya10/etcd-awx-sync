@@ -26,6 +26,7 @@ except ImportError:
 from src.agent import create_agent_from_env, SlackMCPAgent
 from src.mcps import register_mcp
 from src.mcps.etcd_awx import EtcdAwxMCP
+from src.mcps.awx_playbook import AwxPlaybookMCP
 
 
 # Global agent reference for health checks
@@ -109,10 +110,14 @@ async def main():
         logger.error(f"Failed to register etcd-awx-sync MCP: {e}")
         # Continue without this MCP
 
-    # Add more MCPs here as they are developed
-    # Example:
-    # from src.mcps.ansible_aws import AnsibleAwsMCP
-    # register_mcp(AnsibleAwsMCP())
+    # Register awx-playbook MCP
+    try:
+        awx_playbook_mcp = AwxPlaybookMCP()
+        register_mcp(awx_playbook_mcp)
+        logger.info(f"Registered MCP: {awx_playbook_mcp.name}")
+    except Exception as e:
+        logger.error(f"Failed to register awx-playbook MCP: {e}")
+        # Continue without this MCP
 
     # Create agent
     logger.info("Creating Slack agent...")

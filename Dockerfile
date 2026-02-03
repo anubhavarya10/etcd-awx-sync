@@ -15,8 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY main.py .
 
-# Copy etcd_to_awx sync script
+# Copy etcd_to_awx sync script and debug tools
 COPY etcd_to_awx.py ./etcd-awx-sync/
+COPY debug_awx_auth.py ./etcd-awx-sync/
 
 # Set environment variables
 ENV PYTHONPATH="/app:/app/etcd-awx-sync"

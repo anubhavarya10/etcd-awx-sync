@@ -4,7 +4,7 @@ import os
 import asyncio
 import time
 import logging
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from ..base import BaseMCP, MCPAction, MCPResult, MCPResultStatus
@@ -206,6 +206,22 @@ class EtcdAwxMCP(BaseMCP):
             ],
         ))
 
+        self.register_action(MCPAction(
+            name="update",
+            description="Update an existing inventory with fresh data from etcd",
+            parameters=[
+                {"name": "domain", "type": "string", "description": "Domain filter", "required": False},
+                {"name": "role", "type": "string", "description": "Role filter", "required": False},
+                {"name": "inventory_name", "type": "string", "description": "Name of inventory to update", "required": False},
+            ],
+            requires_confirmation=False,
+            examples=[
+                "update inventory mim-nwxp",
+                "update mphpp-pubwxp inventory",
+                "refresh mim inventory for nwxp",
+            ],
+        ))
+
     async def execute(
         self,
         action: str,
@@ -230,6 +246,10 @@ class EtcdAwxMCP(BaseMCP):
             return await self._handle_count(parameters)
         elif action == "count-domains":
             return await self._handle_count_domains(parameters)
+        elif action == "update":
+            # Update is like create but with force_update=True
+            parameters["force_update"] = True
+            return await self._handle_create(parameters, user_id, channel_id)
         else:
             return MCPResult(
                 status=MCPResultStatus.ERROR,
@@ -249,17 +269,11 @@ class EtcdAwxMCP(BaseMCP):
 
         inventory_name = parameters.get("inventory_name", "central inventory")
 
-        return self.create_confirmation(
-            action="sync",
-            parameters={"inventory_name": inventory_name},
-            user_id=user_id,
-            channel_id=channel_id,
-            confirmation_message=(
-                f"*Confirm Full Sync*\n\n"
-                f"This will sync *{host_count}* hosts from etcd to AWX.\n"
-                f"Inventory: `{inventory_name}`\n\n"
-                f"Do you want to proceed?"
-            ),
+        logger.info(f"Running full sync: {host_count} hosts, inventory={inventory_name}")
+
+        # Run sync directly (no confirmation)
+        return await self._run_sync(
+            inventory_name=inventory_name,
         )
 
     async def _handle_create(
@@ -272,48 +286,52 @@ class EtcdAwxMCP(BaseMCP):
         domain = parameters.get("domain")
         role = parameters.get("role")
         inventory_name = parameters.get("inventory_name")
+        force_update = parameters.get("force_update", False)
 
-        if not domain and not role:
-            # If no filters, treat as full sync
-            return await self._handle_sync(parameters, user_id, channel_id)
+        logger.info(f"_handle_create called with: domain={domain}, role={role}, inventory_name={inventory_name}")
 
-        # Refresh cache
+        # Refresh cache to validate inputs
         await self._refresh_cache()
 
-        # Validate domain
-        if domain and domain.lower() not in {d.lower() for d in self._cache["domains"]}:
-            available = sorted(self._cache["domains"])[:10]
-            return MCPResult(
-                status=MCPResultStatus.ERROR,
-                message=(
-                    f"Unknown domain: `{domain}`\n\n"
-                    f"Available domains include: {', '.join(f'`{d}`' for d in available)}...\n"
-                    f"Use `list domains` to see all available domains."
+        # Validate role if provided
+        if role:
+            role_lower = role.lower()
+            valid_roles = {r.lower(): r for r in self._cache["roles"]}
+            if role_lower not in valid_roles:
+                suggestions = self._find_similar(role, self._cache["roles"], limit=5)
+                suggestion_str = ", ".join(f"`{s}`" for s in suggestions) if suggestions else "none found"
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=(
+                        f"⚠️ *Unknown role:* `{role}`\n\n"
+                        f"*Did you mean:* {suggestion_str}\n\n"
+                        f"Use `list roles` to see all available roles.\n\n"
+                        f"_Ready for next task_"
+                    )
                 )
-            )
+            # Use the correct case from cache
+            role = valid_roles[role_lower]
 
-        # Validate role
-        if role and role.lower() not in {r.lower() for r in self._cache["roles"]}:
-            available = sorted(self._cache["roles"])[:10]
-            return MCPResult(
-                status=MCPResultStatus.ERROR,
-                message=(
-                    f"Unknown role: `{role}`\n\n"
-                    f"Available roles include: {', '.join(f'`{r}`' for r in available)}...\n"
-                    f"Use `list roles` to see all available roles."
+        # Validate domain if provided
+        if domain:
+            domain_lower = domain.lower()
+            valid_domains = {d.lower(): d for d in self._cache["domains"]}
+            if domain_lower not in valid_domains:
+                suggestions = self._find_similar(domain, self._cache["domains"], limit=5)
+                suggestion_str = ", ".join(f"`{s}`" for s in suggestions) if suggestions else "none found"
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=(
+                        f"⚠️ *Unknown domain:* `{domain}`\n\n"
+                        f"*Did you mean:* {suggestion_str}\n\n"
+                        f"Use `list domains` to see all available domains.\n\n"
+                        f"_Ready for next task_"
+                    )
                 )
-            )
+            # Use the correct case from cache
+            domain = valid_domains[domain_lower]
 
-        # Count matching hosts
-        matching_count = self._count_matching_hosts(domain, role)
-
-        if matching_count == 0:
-            return MCPResult(
-                status=MCPResultStatus.ERROR,
-                message=f"No hosts match the filters: domain=`{domain or 'all'}`, role=`{role or 'all'}`"
-            )
-
-        # Build inventory name
+        # Build inventory name if not provided
         if not inventory_name:
             if role and domain:
                 inventory_name = f"{role}-{domain}"
@@ -321,31 +339,132 @@ class EtcdAwxMCP(BaseMCP):
                 inventory_name = f"{role}-all-domains"
             elif domain:
                 inventory_name = f"{domain}-inventory"
+            else:
+                inventory_name = "central inventory"
 
-        # Build confirmation message
+        # Count matching hosts
+        matching_count = self._count_matching_hosts(domain, role)
+
+        if matching_count == 0:
+            hint = ""
+            if domain:
+                hint = f"Try `list roles in {domain}`"
+            elif role:
+                hint = f"Try `list domains for {role}`"
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    f"⚠️ *No hosts found*\n\n"
+                    f"Filters: Role=`{role or 'all'}` | Domain=`{domain or 'all'}`\n\n"
+                    f"Both role and domain are valid, but no hosts match this combination.\n"
+                    f"{hint}\n\n"
+                    f"_Ready for next task_"
+                )
+            )
+
+        # Build filter description for status message
         filter_parts = []
-        if domain:
-            filter_parts.append(f"Domain: `{domain}`")
         if role:
             filter_parts.append(f"Role: `{role}`")
+        if domain:
+            filter_parts.append(f"Domain: `{domain}`")
+        filter_str = " | ".join(filter_parts) if filter_parts else "ALL hosts"
 
-        return self.create_confirmation(
-            action="create",
-            parameters={
-                "domain": domain,
-                "role": role,
-                "inventory_name": inventory_name,
-            },
-            user_id=user_id,
-            channel_id=channel_id,
-            confirmation_message=(
-                f"*Confirm Inventory Creation*\n\n"
-                f"Filters: {' | '.join(filter_parts)}\n"
-                f"Matching hosts: *{matching_count}*\n"
-                f"Inventory name: `{inventory_name}`\n\n"
-                f"Do you want to proceed?"
-            ),
+        # Check if inventory already exists in AWX (unless force_update)
+        if not force_update:
+            existing = await self._check_inventory_exists(inventory_name)
+            if existing:
+                inv_id = existing.get("id")
+                host_count = existing.get("total_hosts", 0)
+                inv_link = f"<http://{self.awx_server}/#/inventories/inventory/{inv_id}/hosts|{inventory_name}>"
+                return MCPResult(
+                    status=MCPResultStatus.SUCCESS,
+                    message=(
+                        f"ℹ️ *Inventory already exists*\n\n"
+                        f"*Inventory:* {inv_link}\n"
+                        f"*Current hosts:* {host_count}\n\n"
+                        f"To update: `update inventory {inventory_name}`\n\n"
+                        f"_Ready for next task_"
+                    ),
+                    data={"inventory_id": inv_id, "inventory_name": inventory_name, "exists": True}
+                )
+
+        logger.info(f"Running sync: {filter_str}, {matching_count} hosts, inventory={inventory_name}")
+
+        # Run sync directly
+        return await self._run_sync(
+            domain_filter=domain,
+            role_filter=role,
+            inventory_name=inventory_name,
         )
+
+    def _find_similar(self, term: str, candidates: set, limit: int = 5) -> List[str]:
+        """Find similar terms using prefix matching and edit distance."""
+        term_lower = term.lower()
+        matches = []
+
+        # First, try prefix matching
+        prefix_matches = [c for c in candidates if c.lower().startswith(term_lower[:2])]
+        matches.extend(sorted(prefix_matches)[:limit])
+
+        # If not enough matches, try substring matching
+        if len(matches) < limit:
+            substring_matches = [c for c in candidates if term_lower in c.lower() or c.lower() in term_lower]
+            for m in substring_matches:
+                if m not in matches:
+                    matches.append(m)
+                if len(matches) >= limit:
+                    break
+
+        # If still not enough, add some based on similar length
+        if len(matches) < limit:
+            by_length = sorted(candidates, key=lambda x: abs(len(x) - len(term)))
+            for m in by_length:
+                if m not in matches:
+                    matches.append(m)
+                if len(matches) >= limit:
+                    break
+
+        return matches[:limit]
+
+    async def _check_inventory_exists(self, inventory_name: str) -> Optional[Dict[str, Any]]:
+        """Check if an inventory already exists in AWX."""
+        try:
+            import requests
+
+            # Get AWX credentials from environment
+            awx_server = os.environ.get("AWX_SERVER", "localhost")
+            awx_username = os.environ.get("AWX_USERNAME")
+            awx_password = os.environ.get("AWX_PASSWORD")
+
+            if not awx_username or not awx_password:
+                logger.warning("AWX credentials not set, skipping inventory existence check")
+                return None
+
+            url = f"http://{awx_server}/api/v2/inventories/"
+            response = requests.get(
+                url,
+                params={"name": inventory_name},
+                auth=(awx_username, awx_password),
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                results = response.json().get("results", [])
+                if results:
+                    inv = results[0]
+                    return {
+                        "id": inv.get("id"),
+                        "name": inv.get("name"),
+                        "total_hosts": inv.get("total_hosts", 0),
+                        "total_groups": inv.get("total_groups", 0),
+                    }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error checking inventory existence: {e}")
+            return None
 
     async def _handle_list_domains(self, parameters: Dict[str, Any]) -> MCPResult:
         """Handle list domains action."""
@@ -591,19 +710,23 @@ class EtcdAwxMCP(BaseMCP):
         domain_filter: Optional[str] = None,
         role_filter: Optional[str] = None,
         inventory_name: Optional[str] = None,
+        timeout_seconds: int = 300,  # 5 minute timeout
     ) -> MCPResult:
-        """Run the actual sync operation."""
+        """Run the actual sync operation with timeout."""
         start_time = time.time()
 
         try:
-            # Run in thread pool to avoid blocking
+            # Run in thread pool to avoid blocking, with timeout
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                _executor,
-                self._sync_worker,
-                domain_filter,
-                role_filter,
-                inventory_name,
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    _executor,
+                    self._sync_worker,
+                    domain_filter,
+                    role_filter,
+                    inventory_name,
+                ),
+                timeout=timeout_seconds
             )
 
             duration = time.time() - start_time
@@ -622,21 +745,23 @@ class EtcdAwxMCP(BaseMCP):
                 if result.get("inventory_id"):
                     inv_link = f"<http://{self.awx_server}/#/inventories/inventory/{result['inventory_id']}/hosts|{result['inventory_name']}>"
 
+                # Build filter description
+                filter_parts = []
+                if domain_filter:
+                    filter_parts.append(f"Domain: `{domain_filter}`")
+                if role_filter:
+                    filter_parts.append(f"Role: `{role_filter}`")
+                filter_str = " | ".join(filter_parts) if filter_parts else "All hosts"
+
                 message = (
-                    f"*Sync Complete*\n\n"
+                    f"✅ *Task Complete*\n\n"
                     f"*Inventory:* {inv_link}\n"
                     f"*Hosts:* {result['host_count']}\n"
                     f"*Groups:* {result['group_count']}\n"
-                    f"*Duration:* {duration_str}"
+                    f"*Filters:* {filter_str}\n"
+                    f"*Duration:* {duration_str}\n\n"
+                    f"_Ready for next task_"
                 )
-
-                if domain_filter or role_filter:
-                    filter_parts = []
-                    if domain_filter:
-                        filter_parts.append(f"Domain: `{domain_filter}`")
-                    if role_filter:
-                        filter_parts.append(f"Role: `{role_filter}`")
-                    message += f"\n*Filters:* {' | '.join(filter_parts)}"
 
                 return MCPResult(
                     status=MCPResultStatus.SUCCESS,
@@ -646,8 +771,16 @@ class EtcdAwxMCP(BaseMCP):
             else:
                 return MCPResult(
                     status=MCPResultStatus.ERROR,
-                    message=f"Sync failed: {result.get('error', 'Unknown error')}",
+                    message=f"❌ *Sync failed:* {result.get('error', 'Unknown error')}\n\n_Ready for next task_",
                 )
+
+        except asyncio.TimeoutError:
+            duration = time.time() - start_time
+            logger.error(f"Sync timed out after {duration:.1f}s")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"⏱️ *Task timed out* after {timeout_seconds//60} minutes.\n\nThe AWX server may be slow or unreachable.\n\n_Ready for next task_",
+            )
 
         except Exception as e:
             logger.exception("Error running sync")
