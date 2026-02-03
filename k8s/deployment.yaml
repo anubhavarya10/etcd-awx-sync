@@ -49,15 +49,6 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
-          volumeMounts:
-            - name: etcd-awx-sync
-              mountPath: /app/etcd-awx-sync
-              readOnly: true
-      volumes:
-        - name: etcd-awx-sync
-          configMap:
-            name: etcd-awx-sync-code
-            optional: true
       restartPolicy: Always
 ---
 apiVersion: v1
