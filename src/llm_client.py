@@ -309,27 +309,40 @@ class MockLLMClient(BaseLLMClient):
                 model="mock",
             )
 
-        # Show repo config - "show repo", "current repo", "playbook repo"
-        if ("show" in user_lower or "current" in user_lower) and "repo" in user_lower:
-            return LLMResponse(
-                content=json.dumps({
-                    "mcp_name": "awx-playbook",
-                    "action": "show-repo",
-                    "parameters": {},
-                    "confidence": 0.95,
-                    "explanation": "User wants to see current repo configuration"
-                }),
-                model="mock",
-            )
+        # Show repo config - "show repo", "list repo", "current repo", "playbook repo"
+        if ("show" in user_lower or "list" in user_lower or "current" in user_lower) and "repo" in user_lower:
+            # But not if it's a "set repo" command
+            if "set" not in user_lower and "change" not in user_lower and "use" not in user_lower:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "awx-playbook",
+                        "action": "show-repo",
+                        "parameters": {},
+                        "confidence": 0.95,
+                        "explanation": "User wants to see current repo configuration"
+                    }),
+                    model="mock",
+                )
 
         # Set repo - "set repo <org/repo> [path <folder>] [branch <branch>]"
+        # Also handles full URLs like https://github.com/org/repo
         if ("set" in user_lower or "change" in user_lower or "use" in user_lower) and "repo" in user_lower:
             params = {}
-            # Find repo (contains /)
-            for term in potential_terms:
-                if "/" in term:
-                    params["repo"] = term
-                    break
+
+            # Look for full GitHub URL and extract org/repo
+            import re
+            url_match = re.search(r'github[^/]*/([^/]+/[^/\s]+)', user_lower)
+            if url_match:
+                repo = url_match.group(1)
+                # Remove .git suffix if present
+                repo = repo.replace('.git', '')
+                params["repo"] = repo
+            else:
+                # Find repo (contains / but not http)
+                for term in potential_terms:
+                    if "/" in term and "http" not in term:
+                        params["repo"] = term
+                        break
 
             # Find path (after "path" keyword)
             if "path" in words:
