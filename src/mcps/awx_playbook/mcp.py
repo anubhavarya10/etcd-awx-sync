@@ -835,7 +835,26 @@ class AwxPlaybookMCP(BaseMCP):
 
         results = response.json().get("results", [])
         if results:
-            return results[0]["id"]
+            project = results[0]
+            project_id = project["id"]
+
+            # Check if project has a credential, if not add one
+            if not project.get("credential") and self.github_token:
+                # Get org ID from project
+                org_id = project.get("organization", 1)
+                scm_credential_id = self._ensure_scm_credential(org_id)
+                if scm_credential_id:
+                    # Update project with credential
+                    update_url = f"http://{self.awx_server}/api/v2/projects/{project_id}/"
+                    requests.patch(
+                        update_url,
+                        json={"credential": scm_credential_id},
+                        auth=(self.awx_username, self.awx_password),
+                        timeout=30
+                    )
+                    logger.info(f"Updated project {project_id} with SCM credential {scm_credential_id}")
+
+            return project_id
 
         # Get organization ID
         org_url = f"http://{self.awx_server}/api/v2/organizations/"
@@ -846,6 +865,11 @@ class AwxPlaybookMCP(BaseMCP):
         )
         org_response.raise_for_status()
         org_id = org_response.json().get("results", [{}])[0].get("id", 1)
+
+        # Create or get SCM credential for GitHub
+        scm_credential_id = None
+        if self.github_token:
+            scm_credential_id = self._ensure_scm_credential(org_id)
 
         # Create project
         # Build the full GitHub URL for SCM
@@ -862,11 +886,73 @@ class AwxPlaybookMCP(BaseMCP):
             "scm_update_on_launch": True,
         }
 
-        # Add credential if token is available
-        if self.github_token:
-            # We'd need to create a credential for this
-            # For now, assume the repo is accessible
-            pass
+        # Add SCM credential if available
+        if scm_credential_id:
+            payload["credential"] = scm_credential_id
+
+        response = requests.post(
+            url,
+            json=payload,
+            auth=(self.awx_username, self.awx_password),
+            timeout=30
+        )
+        response.raise_for_status()
+
+        return response.json().get("id")
+
+    def _ensure_scm_credential(self, org_id: int) -> Optional[int]:
+        """Create or get SCM credential for GitHub authentication."""
+        credential_name = "slack-bot-github-token"
+
+        # Check if credential exists
+        url = f"http://{self.awx_server}/api/v2/credentials/"
+        response = requests.get(
+            url,
+            params={"name": credential_name},
+            auth=(self.awx_username, self.awx_password),
+            timeout=30
+        )
+        response.raise_for_status()
+
+        results = response.json().get("results", [])
+        if results:
+            # Update existing credential with current token
+            cred_id = results[0]["id"]
+            update_url = f"http://{self.awx_server}/api/v2/credentials/{cred_id}/"
+            requests.patch(
+                update_url,
+                json={"inputs": {"password": self.github_token}},
+                auth=(self.awx_username, self.awx_password),
+                timeout=30
+            )
+            return cred_id
+
+        # Get credential type ID for "Source Control"
+        cred_type_url = f"http://{self.awx_server}/api/v2/credential_types/"
+        cred_type_response = requests.get(
+            cred_type_url,
+            params={"name": "Source Control"},
+            auth=(self.awx_username, self.awx_password),
+            timeout=30
+        )
+        cred_type_response.raise_for_status()
+        cred_types = cred_type_response.json().get("results", [])
+        if not cred_types:
+            logger.error("Could not find 'Source Control' credential type")
+            return None
+        cred_type_id = cred_types[0]["id"]
+
+        # Create credential
+        payload = {
+            "name": credential_name,
+            "description": "Auto-created by Slack bot for GitHub access",
+            "organization": org_id,
+            "credential_type": cred_type_id,
+            "inputs": {
+                "username": "git",
+                "password": self.github_token,
+            },
+        }
 
         response = requests.post(
             url,
