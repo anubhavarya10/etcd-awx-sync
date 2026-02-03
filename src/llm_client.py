@@ -309,6 +309,51 @@ class MockLLMClient(BaseLLMClient):
                 model="mock",
             )
 
+        # Show repo config - "show repo", "current repo", "playbook repo"
+        if ("show" in user_lower or "current" in user_lower) and "repo" in user_lower:
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "awx-playbook",
+                    "action": "show-repo",
+                    "parameters": {},
+                    "confidence": 0.95,
+                    "explanation": "User wants to see current repo configuration"
+                }),
+                model="mock",
+            )
+
+        # Set repo - "set repo <org/repo> [path <folder>] [branch <branch>]"
+        if ("set" in user_lower or "change" in user_lower or "use" in user_lower) and "repo" in user_lower:
+            params = {}
+            # Find repo (contains /)
+            for term in potential_terms:
+                if "/" in term:
+                    params["repo"] = term
+                    break
+
+            # Find path (after "path" keyword)
+            if "path" in words:
+                path_idx = words.index("path")
+                if path_idx + 1 < len(words):
+                    params["path"] = words[path_idx + 1]
+
+            # Find branch (after "branch" keyword)
+            if "branch" in words:
+                branch_idx = words.index("branch")
+                if branch_idx + 1 < len(words):
+                    params["branch"] = words[branch_idx + 1]
+
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "awx-playbook",
+                    "action": "set-repo",
+                    "parameters": params,
+                    "confidence": 0.9,
+                    "explanation": f"User wants to set playbook repo: {params}"
+                }),
+                model="mock",
+            )
+
         # List jobs
         if ("list" in user_lower or "show" in user_lower) and "job" in user_lower:
             params = {}

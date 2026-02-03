@@ -175,6 +175,49 @@ class AwxPlaybookMCP(BaseMCP):
             ],
         ))
 
+        self.register_action(MCPAction(
+            name="set-repo",
+            description="Change the GitHub repository for playbooks",
+            parameters=[
+                {
+                    "name": "repo",
+                    "type": "string",
+                    "description": "GitHub repository (e.g., org/repo-name)",
+                    "required": True,
+                },
+                {
+                    "name": "path",
+                    "type": "string",
+                    "description": "Path to playbooks folder (default: ansible)",
+                    "required": False,
+                },
+                {
+                    "name": "branch",
+                    "type": "string",
+                    "description": "Branch name (default: main)",
+                    "required": False,
+                },
+            ],
+            requires_confirmation=False,
+            examples=[
+                "set repo unity/vivox-ops-docker",
+                "set repo unity/ansible-playbooks path playbooks",
+                "change repo to org/new-repo branch develop",
+            ],
+        ))
+
+        self.register_action(MCPAction(
+            name="show-repo",
+            description="Show the current playbook repository configuration",
+            parameters=[],
+            requires_confirmation=False,
+            examples=[
+                "show repo",
+                "current repo",
+                "playbook repo config",
+            ],
+        ))
+
     async def execute(
         self,
         action: str,
@@ -195,6 +238,10 @@ class AwxPlaybookMCP(BaseMCP):
             return await self._handle_job_output(parameters)
         elif action == "list-jobs":
             return await self._handle_list_jobs(parameters)
+        elif action == "set-repo":
+            return await self._handle_set_repo(parameters)
+        elif action == "show-repo":
+            return await self._handle_show_repo()
         else:
             return MCPResult(
                 status=MCPResultStatus.ERROR,
@@ -217,6 +264,16 @@ class AwxPlaybookMCP(BaseMCP):
                     )
                 )
 
+            # Auto-create/sync AWX project so playbooks appear in AWX GUI
+            project_id = await self._ensure_awx_project()
+            project_status = ""
+            if project_id:
+                # Trigger project sync
+                await self._sync_awx_project(project_id)
+                project_status = f"\n*AWX Project:* Synced (ID: {project_id})"
+            else:
+                project_status = "\n*AWX Project:* ⚠️ Could not create (check AWX credentials)"
+
             lines = ["📚 *Available Playbooks*\n"]
             for pb in playbooks:
                 name = pb.get("name", "unknown")
@@ -226,13 +283,14 @@ class AwxPlaybookMCP(BaseMCP):
 
             lines.append(f"\n*Total:* {len(playbooks)} playbooks")
             lines.append(f"*Source:* `{self.github_repo}/{self.github_path}`")
+            lines.append(project_status)
             lines.append("\n_To run: `/agent run playbook <name> on <inventory>`_")
             lines.append("\n_Ready for next task_")
 
             return MCPResult(
                 status=MCPResultStatus.SUCCESS,
                 message="\n".join(lines),
-                data={"playbooks": playbooks}
+                data={"playbooks": playbooks, "project_id": project_id}
             )
 
         except Exception as e:
@@ -524,6 +582,136 @@ class AwxPlaybookMCP(BaseMCP):
                 message=f"❌ *Error listing jobs:* {str(e)}\n\n_Ready for next task_"
             )
 
+    async def _handle_set_repo(self, parameters: Dict[str, Any]) -> MCPResult:
+        """Set the GitHub repository for playbooks."""
+        repo = parameters.get("repo", "").strip()
+        path = parameters.get("path", "").strip()
+        branch = parameters.get("branch", "").strip()
+
+        if not repo:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    "⚠️ *Repository required*\n\n"
+                    "Usage: `set repo <org/repo-name> [path <folder>] [branch <branch>]`\n\n"
+                    "Example: `set repo unity/ansible-playbooks path playbooks branch main`\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        # Validate repo format (should be org/repo)
+        if "/" not in repo:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    f"⚠️ *Invalid repository format:* `{repo}`\n\n"
+                    "Expected format: `org/repo-name`\n"
+                    "Example: `unity/vivox-ops-docker`\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        old_repo = self.github_repo
+        old_path = self.github_path
+        old_branch = self.github_branch
+
+        # Update configuration
+        self.github_repo = repo
+        if path:
+            self.github_path = path
+        if branch:
+            self.github_branch = branch
+
+        # Clear cache to force refresh
+        self._playbook_cache = {"playbooks": [], "last_refresh": 0}
+        # Reset AWX project ID since repo changed
+        self._awx_project_id = None
+
+        # Try to fetch playbooks from new repo to validate
+        try:
+            playbooks = await self._fetch_playbooks_from_github()
+
+            if not playbooks:
+                # Revert changes
+                self.github_repo = old_repo
+                self.github_path = old_path
+                self.github_branch = old_branch
+                self._playbook_cache = {"playbooks": [], "last_refresh": 0}
+
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=(
+                        f"⚠️ *No playbooks found in new repo*\n\n"
+                        f"Repository: `{repo}`\n"
+                        f"Path: `{path or self.github_path}`\n"
+                        f"Branch: `{branch or self.github_branch}`\n\n"
+                        "Configuration not changed.\n\n"
+                        "_Ready for next task_"
+                    )
+                )
+
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS,
+                message=(
+                    f"✅ *Repository Updated*\n\n"
+                    f"*Repository:* `{self.github_repo}`\n"
+                    f"*Path:* `{self.github_path}`\n"
+                    f"*Branch:* `{self.github_branch}`\n\n"
+                    f"*Playbooks found:* {len(playbooks)}\n\n"
+                    "_Ready for next task_"
+                ),
+                data={"repo": self.github_repo, "path": self.github_path, "branch": self.github_branch}
+            )
+
+        except Exception as e:
+            # Revert changes on error
+            self.github_repo = old_repo
+            self.github_path = old_path
+            self.github_branch = old_branch
+            self._playbook_cache = {"playbooks": [], "last_refresh": 0}
+
+            logger.exception("Error setting repo")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    f"❌ *Error accessing repository:* {str(e)}\n\n"
+                    "Configuration not changed.\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+    async def _handle_show_repo(self) -> MCPResult:
+        """Show current playbook repository configuration."""
+        # Get playbook count from cache or fetch
+        playbook_count = len(self._playbook_cache.get("playbooks", []))
+        if playbook_count == 0:
+            try:
+                playbooks = await self._fetch_playbooks_from_github()
+                playbook_count = len(playbooks)
+            except Exception:
+                playbook_count = 0
+
+        return MCPResult(
+            status=MCPResultStatus.SUCCESS,
+            message=(
+                f"📁 *Playbook Repository Configuration*\n\n"
+                f"*Repository:* `{self.github_repo}`\n"
+                f"*Path:* `{self.github_path}`\n"
+                f"*Branch:* `{self.github_branch}`\n"
+                f"*API URL:* `{self.github_api_url}`\n\n"
+                f"*Playbooks available:* {playbook_count}\n\n"
+                f"To change: `set repo <org/repo> [path <folder>] [branch <branch>]`\n\n"
+                f"_Ready for next task_"
+            ),
+            data={
+                "repo": self.github_repo,
+                "path": self.github_path,
+                "branch": self.github_branch,
+                "api_url": self.github_api_url,
+                "playbook_count": playbook_count,
+            }
+        )
+
     # Helper methods
 
     def _get_status_emoji(self, status: str) -> str:
@@ -689,6 +877,34 @@ class AwxPlaybookMCP(BaseMCP):
         response.raise_for_status()
 
         return response.json().get("id")
+
+    async def _sync_awx_project(self, project_id: int) -> bool:
+        """Trigger a sync of the AWX project."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                _executor,
+                self._sync_awx_project_sync,
+                project_id,
+            )
+        except Exception as e:
+            logger.error(f"Error syncing AWX project: {e}")
+            return False
+
+    def _sync_awx_project_sync(self, project_id: int) -> bool:
+        """Synchronously trigger a project sync."""
+        url = f"http://{self.awx_server}/api/v2/projects/{project_id}/update/"
+        try:
+            response = requests.post(
+                url,
+                auth=(self.awx_username, self.awx_password),
+                timeout=30
+            )
+            # 202 Accepted is success for async operations
+            return response.status_code in [200, 201, 202]
+        except Exception as e:
+            logger.error(f"Error syncing project: {e}")
+            return False
 
     async def _ensure_job_template(
         self,
