@@ -288,23 +288,57 @@ class MockLLMClient(BaseLLMClient):
             'all', 'are', 'is', 'there', 'do', 'can', 'please', 'me', 'i',
             'want', 'need', 'would', 'like', 'to', 'see', 'hosts', 'servers',
             'host', 'server', 'domain', 'domains', 'role', 'roles', 'inventory',
-            'create', 'sync', 'status', 'help', 'with', 'of', 'from', 'and', 'or'
+            'create', 'sync', 'status', 'help', 'with', 'of', 'from', 'and', 'or',
+            'playbook', 'playbooks', 'run', 'job', 'jobs', 'on', 'repo'
         }
 
         # Extract potential role/domain - any word that's not a common word
         potential_terms = [w for w in words if w not in skip_words and len(w) >= 2]
 
-        # === PLAYBOOK COMMANDS ===
+        # === PLAYBOOK COMMANDS (flexible matching) ===
 
-        # List playbooks
-        if ("list" in user_lower or "show" in user_lower) and "playbook" in user_lower:
+        # Helper: check if word matches (handles typos, singular/plural)
+        def matches(word, targets):
+            """Check if word matches any target (fuzzy)."""
+            word = word.lower()
+            for t in targets:
+                if word == t or word.startswith(t[:3]) or t.startswith(word[:3]):
+                    return True
+                # Handle singular/plural
+                if word.rstrip('s') == t.rstrip('s'):
+                    return True
+            return False
+
+        # Detect playbook-related commands
+        has_playbook = any(matches(w, ['playbook', 'playbooks']) for w in words)
+        has_show = any(matches(w, ['show', 'view', 'see', 'inspect', 'whats', "what's"]) for w in words)
+        has_list = any(matches(w, ['list', 'ls', 'get', 'all']) for w in words)
+        has_run = any(matches(w, ['run', 'execute', 'start', 'launch']) for w in words)
+
+        # Show specific playbook - "show playbook X", "whats in X"
+        if has_playbook and has_show and potential_terms:
+            # Get first meaningful term that's not a command word
+            for term in potential_terms:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "awx-playbook",
+                        "action": "show-playbook",
+                        "parameters": {"playbook": term},
+                        "confidence": 0.95,
+                        "explanation": f"Show playbook: {term}"
+                    }),
+                    model="mock",
+                )
+
+        # List playbooks - "list playbooks", "show playbooks", "playbooks"
+        if has_playbook and (has_list or (has_show and not potential_terms)):
             return LLMResponse(
                 content=json.dumps({
                     "mcp_name": "awx-playbook",
                     "action": "list-playbooks",
                     "parameters": {},
                     "confidence": 0.95,
-                    "explanation": "User wants to list available playbooks"
+                    "explanation": "List playbooks"
                 }),
                 model="mock",
             )
@@ -367,49 +401,34 @@ class MockLLMClient(BaseLLMClient):
                 model="mock",
             )
 
-        # List jobs
-        if ("list" in user_lower or "show" in user_lower) and "job" in user_lower:
-            params = {}
-            if potential_terms:
-                params["inventory"] = potential_terms[0]
+        # === SSH/CREDENTIAL COMMANDS ===
+        has_ssh = any(matches(w, ['ssh', 'credential', 'credentials', 'key']) for w in words)
+        has_setup = any(matches(w, ['setup', 'check', 'configure', 'status']) for w in words)
+
+        if has_ssh and (has_setup or len(words) <= 2):
             return LLMResponse(
                 content=json.dumps({
                     "mcp_name": "awx-playbook",
-                    "action": "list-jobs",
-                    "parameters": params,
+                    "action": "setup-ssh",
+                    "parameters": {},
                     "confidence": 0.95,
-                    "explanation": "User wants to list recent jobs"
+                    "explanation": "Check SSH credential status"
                 }),
                 model="mock",
             )
 
-        # Job status - "job status 123" or "status of job 123"
-        if "job" in user_lower and ("status" in user_lower or "check" in user_lower):
-            # Look for a job ID (numeric)
-            job_id = None
-            for term in potential_terms:
-                if term.isdigit():
-                    job_id = term
-                    break
-            if job_id:
-                return LLMResponse(
-                    content=json.dumps({
-                        "mcp_name": "awx-playbook",
-                        "action": "job-status",
-                        "parameters": {"job_id": job_id},
-                        "confidence": 0.95,
-                        "explanation": f"Check status of job {job_id}"
-                    }),
-                    model="mock",
-                )
+        # === JOB COMMANDS (flexible matching) ===
+        has_job = any(matches(w, ['job', 'jobs']) for w in words)
 
-        # Job output - "job output 123" or "show output of job 123"
-        if "job" in user_lower and ("output" in user_lower or "log" in user_lower or "result" in user_lower):
-            job_id = None
-            for term in potential_terms:
-                if term.isdigit():
-                    job_id = term
-                    break
+        # Find job ID (numeric) if present
+        job_id = None
+        for w in words:
+            if w.isdigit():
+                job_id = w
+                break
+
+        # Job output - "job output 123", "log 123", "output of job 123"
+        if has_job and any(matches(w, ['output', 'log', 'logs', 'result', 'results']) for w in words):
             if job_id:
                 return LLMResponse(
                     content=json.dumps({
@@ -422,34 +441,63 @@ class MockLLMClient(BaseLLMClient):
                     model="mock",
                 )
 
+        # Job status - "job status 123", "check job 123", "status 123"
+        if has_job and any(matches(w, ['status', 'check', 'state']) for w in words):
+            if job_id:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "awx-playbook",
+                        "action": "job-status",
+                        "parameters": {"job_id": job_id},
+                        "confidence": 0.95,
+                        "explanation": f"Check status of job {job_id}"
+                    }),
+                    model="mock",
+                )
+
+        # List jobs - "list jobs", "show jobs", "jobs", "list job"
+        if has_job and (has_list or has_show or (len(words) <= 2 and has_job)):
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "awx-playbook",
+                    "action": "list-jobs",
+                    "parameters": {},
+                    "confidence": 0.95,
+                    "explanation": "List recent jobs"
+                }),
+                model="mock",
+            )
+
         # Run playbook - "run <playbook> on <inventory>"
-        if "run" in user_lower and ("playbook" in user_lower or ".yml" in user_lower or ".yaml" in user_lower):
+        if has_run and (has_playbook or ".yml" in user_lower or ".yaml" in user_lower or potential_terms):
             params = {}
-            # Look for playbook name (contains .yml or .yaml, or term after "run")
             playbook_name = None
             inventory_name = None
 
-            # Find terms - playbook is usually before "on", inventory after
-            on_idx = words.index("on") if "on" in words else None
-
-            for term in potential_terms:
-                if ".yml" in term or ".yaml" in term:
-                    playbook_name = term
+            # Find "on" to split playbook and inventory
+            on_idx = None
+            for i, w in enumerate(words):
+                if w == "on":
+                    on_idx = i
                     break
 
-            # If no .yml found, look for term after "run"
-            if not playbook_name:
-                run_idx = words.index("run") if "run" in words else None
-                if run_idx is not None and run_idx + 1 < len(words):
-                    next_term = words[run_idx + 1]
-                    if next_term not in skip_words and next_term != "playbook":
-                        playbook_name = next_term
-
-            # Find inventory (term after "on")
+            # Find playbook name - anything between run/playbook and "on"
+            # or first potential term if no "on"
             if on_idx is not None:
-                terms_after_on = [w for w in words[on_idx+1:] if w in potential_terms or "-" in w]
-                if terms_after_on:
-                    inventory_name = terms_after_on[0]
+                # Terms before "on" (excluding command words)
+                for w in words[:on_idx]:
+                    if w not in skip_words and len(w) >= 2:
+                        playbook_name = w
+                        break
+                # Terms after "on" for inventory
+                for w in words[on_idx+1:]:
+                    if len(w) >= 2:  # inventory names like mim-aptus2
+                        inventory_name = w
+                        break
+            else:
+                # No "on", just get first meaningful term
+                if potential_terms:
+                    playbook_name = potential_terms[0]
 
             if playbook_name:
                 params["playbook"] = playbook_name

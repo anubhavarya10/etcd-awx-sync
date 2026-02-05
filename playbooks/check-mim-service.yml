@@ -1,0 +1,29 @@
+---
+# Playbook: check-mim-service.yml
+# Description: Check mongooseim service status on mim hosts
+# Usage: run playbook check-mim-service on mim-<domain>
+
+- name: Check MongooseIM Service Status
+  hosts: all
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: Check mongooseim service status
+      ansible.builtin.command: systemctl status mongooseim --no-pager
+      register: service_status
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display service status
+      ansible.builtin.debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          Service: mongooseim
+          Status: {{ 'RUNNING' if service_status.rc == 0 else 'NOT RUNNING' }}
+          ---
+          {{ service_status.stdout }}
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: mongooseim is {{ 'active' if service_status.rc == 0 else 'inactive/failed' }}"

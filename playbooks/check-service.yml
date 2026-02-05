@@ -1,0 +1,115 @@
+---
+# Playbook: check-service.yml
+# Description: Check service status on hosts - shows running/stopped/failed state
+# Usage:
+#   run playbook check-service on <inventory>                    # Check all known services
+#   run playbook check-service on <inventory> service=mongooseim # Check specific service
+
+- name: Service Status Checker
+  hosts: all
+  gather_facts: no
+  become: yes
+
+  vars:
+    # Default: check all known services. Override with service=<name>
+    service: ""
+
+    # Known application services by role pattern
+    app_services:
+      - mongooseim
+      - morpheus
+      - nginx
+      - tokenstore
+      - opensips
+      - mongod
+      - memcached
+      - redis
+      - haproxy
+      - telegraf
+      - vector
+      - backend_api
+      - madagascar
+      - provnstatdb
+      - harjo
+
+  tasks:
+    # ============ SPECIFIC SERVICE CHECK ============
+    - name: Check specific service
+      when: service is defined and service != ''
+      block:
+        - name: Get service status
+          ansible.builtin.shell: |
+            if systemctl is-active {{ service }} >/dev/null 2>&1; then
+              echo "ACTIVE"
+            elif systemctl is-enabled {{ service }} >/dev/null 2>&1; then
+              systemctl is-active {{ service }} 2>&1 || echo "INACTIVE"
+            else
+              echo "NOT_FOUND"
+            fi
+          register: svc_state
+          changed_when: false
+
+        - name: Get detailed status if exists
+          ansible.builtin.command: systemctl status {{ service }} --no-pager -l
+          register: svc_detail
+          ignore_errors: yes
+          changed_when: false
+          when: svc_state.stdout != 'NOT_FOUND'
+
+        - name: Get recent logs if failed
+          ansible.builtin.shell: journalctl -u {{ service }} -n 20 --no-pager 2>/dev/null || echo "No logs available"
+          register: svc_logs
+          changed_when: false
+          when: svc_state.stdout not in ['ACTIVE', 'NOT_FOUND']
+
+        - name: Display service status
+          ansible.builtin.debug:
+            msg: |
+              === SERVICE STATUS ===
+              Host: {{ inventory_hostname }}
+              Service: {{ service }}
+              State: {{ svc_state.stdout }}
+              {% if svc_state.stdout == 'ACTIVE' %}
+              The service is running normally.
+              {% elif svc_state.stdout == 'NOT_FOUND' %}
+              Service '{{ service }}' is not installed on this host.
+              {% else %}
+              The service is NOT running.
+
+              --- Recent Logs ---
+              {{ svc_logs.stdout | default('No logs') }}
+              {% endif %}
+
+    # ============ DISCOVER ALL SERVICES ============
+    - name: Discover services
+      when: service is not defined or service == ''
+      block:
+        - name: Check status of all known services
+          ansible.builtin.shell: |
+            for svc in {{ app_services | join(' ') }}; do
+              if systemctl is-active $svc >/dev/null 2>&1; then
+                echo "$svc: ACTIVE"
+              elif systemctl list-unit-files | grep -q "^$svc.service"; then
+                echo "$svc: STOPPED"
+              fi
+            done
+          register: all_services
+          changed_when: false
+
+        - name: Display all services
+          ansible.builtin.debug:
+            msg: |
+              === SERVICES ON {{ inventory_hostname }} ===
+              {% for line in all_services.stdout_lines %}
+              {% if 'ACTIVE' in line %}
+              [OK] {{ line | replace(': ACTIVE', '') }} - running
+              {% else %}
+              [!!] {{ line | replace(': STOPPED', '') }} - stopped
+              {% endif %}
+              {% endfor %}
+              {% if all_services.stdout_lines | length == 0 %}
+              No known application services found.
+              {% endif %}
+
+              To check a specific service:
+              run playbook check-service on <inventory> service=<name>

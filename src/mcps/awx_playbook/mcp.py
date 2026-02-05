@@ -218,6 +218,37 @@ class AwxPlaybookMCP(BaseMCP):
             ],
         ))
 
+        self.register_action(MCPAction(
+            name="show-playbook",
+            description="Show files inside a playbook folder",
+            parameters=[
+                {
+                    "name": "playbook",
+                    "type": "string",
+                    "description": "Name of the playbook folder to inspect",
+                    "required": True,
+                },
+            ],
+            requires_confirmation=False,
+            examples=[
+                "show playbook check-service",
+                "what's inside check-service",
+                "list files in harjo-setup",
+            ],
+        ))
+
+        self.register_action(MCPAction(
+            name="setup-ssh",
+            description="Check or setup SSH credential for AWX",
+            parameters=[],
+            requires_confirmation=False,
+            examples=[
+                "setup ssh",
+                "check ssh credential",
+                "awx ssh status",
+            ],
+        ))
+
     async def execute(
         self,
         action: str,
@@ -242,6 +273,10 @@ class AwxPlaybookMCP(BaseMCP):
             return await self._handle_set_repo(parameters)
         elif action == "show-repo":
             return await self._handle_show_repo()
+        elif action == "show-playbook":
+            return await self._handle_show_playbook(parameters)
+        elif action == "setup-ssh":
+            return await self._handle_setup_ssh()
         else:
             return MCPResult(
                 status=MCPResultStatus.ERROR,
@@ -275,16 +310,35 @@ class AwxPlaybookMCP(BaseMCP):
                 project_status = "\n*AWX Project:* ⚠️ Could not create (check AWX credentials)"
 
             lines = ["📚 *Available Playbooks*\n"]
+            folders = []
+            files = []
+
             for pb in playbooks:
                 name = pb.get("name", "unknown")
-                # Remove .yml extension for display
-                display_name = name.replace(".yml", "").replace(".yaml", "")
-                lines.append(f"  • `{display_name}`")
+                pb_type = pb.get("type", "file")
+                if pb_type == "folder":
+                    folders.append(name)
+                else:
+                    # Remove .yml extension for display
+                    display_name = name.replace(".yml", "").replace(".yaml", "")
+                    files.append(display_name)
 
-            lines.append(f"\n*Total:* {len(playbooks)} playbooks")
+            if folders:
+                lines.append("*📂 Playbook Folders* (contain multiple files):")
+                for f in sorted(folders):
+                    lines.append(f"  • `{f}/` - use `show playbook {f}` to see files")
+
+            if files:
+                if folders:
+                    lines.append("\n*📄 Standalone Playbooks:*")
+                for f in sorted(files):
+                    lines.append(f"  • `{f}`")
+
+            lines.append(f"\n*Total:* {len(folders)} folders, {len(files)} files")
             lines.append(f"*Source:* `{self.github_repo}/{self.github_path}`")
             lines.append(project_status)
-            lines.append("\n_To run: `/agent run playbook <name> on <inventory>`_")
+            lines.append("\n_To inspect folder: `show playbook <name>`_")
+            lines.append("_To run: `run playbook <folder>/<file>.yml on <inventory>`_")
             lines.append("\n_Ready for next task_")
 
             return MCPResult(
@@ -311,22 +365,86 @@ class AwxPlaybookMCP(BaseMCP):
         inventory = parameters.get("inventory", "")
         extra_vars = parameters.get("extra_vars")
 
-        # Normalize playbook name
-        if not playbook.endswith((".yml", ".yaml")):
-            playbook = f"{playbook}.yml"
+        # Handle playbook path resolution
+        # User might say: "check-service" or "check-service/check-service.yml"
+        playbook_path = playbook
+        playbook_display = playbook
 
-        # Validate playbook exists
+        # Fetch available playbooks
         playbooks = await self._fetch_playbooks_from_github()
-        playbook_names = [p.get("name", "").lower() for p in playbooks]
 
-        if playbook.lower() not in playbook_names:
+        # Check if it's a folder
+        folder_match = None
+        file_match = None
+
+        for pb in playbooks:
+            name = pb.get("name", "")
+            pb_type = pb.get("type", "file")
+
+            if pb_type == "folder":
+                # Check if user provided folder name (with or without trailing slash)
+                if playbook.lower().rstrip("/") == name.lower():
+                    folder_match = name
+                    break
+            else:
+                # Check if it's a direct file match
+                name_lower = name.lower()
+                playbook_lower = playbook.lower()
+                if playbook_lower == name_lower or playbook_lower + ".yml" == name_lower:
+                    file_match = name
+                    break
+
+        if folder_match:
+            # It's a folder - look for main playbook inside
+            files = await self._fetch_playbook_files(folder_match)
+            yml_files = [f for f in files if f.get("name", "").endswith((".yml", ".yaml"))]
+
+            if not yml_files:
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=(
+                        f"⚠️ *No playbooks found in folder:* `{folder_match}/`\n\n"
+                        "Use `show playbook {folder_match}` to see contents.\n\n"
+                        "_Ready for next task_"
+                    )
+                )
+
+            if len(yml_files) == 1:
+                # Only one playbook - use it
+                playbook_path = f"{folder_match}/{yml_files[0]['name']}"
+                playbook_display = playbook_path
+            else:
+                # Multiple playbooks - ask user to specify
+                file_list = "\n".join([f"  • `{folder_match}/{f['name']}`" for f in yml_files])
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=(
+                        f"📂 *Multiple playbooks in folder:* `{folder_match}/`\n\n"
+                        f"{file_list}\n\n"
+                        f"Please specify which one:\n"
+                        f"`run playbook {folder_match}/<filename>.yml on {inventory}`\n\n"
+                        "_Ready for next task_"
+                    )
+                )
+        elif file_match:
+            playbook_path = file_match
+            playbook_display = file_match
+        elif "/" in playbook:
+            # User specified full path like "check-service/check-service.yml"
+            playbook_path = playbook
+            if not playbook_path.endswith((".yml", ".yaml")):
+                playbook_path = f"{playbook_path}.yml"
+            playbook_display = playbook_path
+        else:
+            # Not found
             suggestions = [p.get("name", "") for p in playbooks[:5]]
             return MCPResult(
                 status=MCPResultStatus.ERROR,
                 message=(
                     f"⚠️ *Unknown playbook:* `{playbook}`\n\n"
-                    f"*Available playbooks:* {', '.join(f'`{s}`' for s in suggestions)}\n\n"
-                    "Use `list playbooks` to see all.\n\n"
+                    f"*Available:* {', '.join(f'`{s}`' for s in suggestions)}\n\n"
+                    "Use `list playbooks` to see all.\n"
+                    "Use `show playbook <name>` to see folder contents.\n\n"
                     "_Ready for next task_"
                 )
             )
@@ -346,25 +464,15 @@ class AwxPlaybookMCP(BaseMCP):
         inv_id = inventory_info.get("id")
         host_count = inventory_info.get("total_hosts", 0)
 
-        # Create confirmation
-        return self.create_confirmation(
-            action="run-playbook",
-            parameters={
-                "playbook": playbook,
-                "inventory": inventory,
-                "inventory_id": inv_id,
-                "extra_vars": extra_vars,
-            },
-            user_id=user_id,
+        # Run immediately without confirmation (user already asked to run)
+        return await self._execute_playbook_with_streaming(
+            playbook=playbook_path,
+            playbook_display=playbook_display,
+            inventory_id=inv_id,
+            inventory_name=inventory,
+            host_count=host_count,
+            extra_vars=extra_vars,
             channel_id=channel_id,
-            confirmation_message=(
-                f"🚀 *Confirm Playbook Execution*\n\n"
-                f"*Playbook:* `{playbook}`\n"
-                f"*Inventory:* `{inventory}` ({host_count} hosts)\n"
-                f"*Extra vars:* `{extra_vars or 'none'}`\n\n"
-                f"⚠️ This will execute the playbook on *{host_count}* hosts.\n\n"
-                f"Do you want to proceed?"
-            ),
         )
 
     async def _execute_confirmed(
@@ -388,14 +496,17 @@ class AwxPlaybookMCP(BaseMCP):
                 message=f"Unknown confirmed action: {action}"
             )
 
-    async def _execute_playbook(
+    async def _execute_playbook_with_streaming(
         self,
         playbook: str,
+        playbook_display: str,
         inventory_id: int,
         inventory_name: str,
+        host_count: int,
         extra_vars: Optional[str] = None,
+        channel_id: Optional[str] = None,
     ) -> MCPResult:
-        """Execute a playbook on AWX."""
+        """Execute a playbook and wait for completion with output."""
         try:
             # Step 1: Ensure AWX project exists
             project_id = await self._ensure_awx_project()
@@ -428,20 +539,44 @@ class AwxPlaybookMCP(BaseMCP):
             job_id = job.get("id")
             job_url = f"http://{self.awx_server}/#/jobs/playbook/{job_id}"
 
+            # Step 4: Wait for job completion and get output
+            final_status, output = await self._wait_for_job_completion(job_id)
+
+            status_emoji = self._get_status_emoji(final_status)
+
+            # Parse and clean up output for readability
+            output = self._format_ansible_output(output)
+
+            # Truncate output for Slack (max ~3000 chars)
+            if len(output) > 2500:
+                output = output[:2500] + "\n... (truncated, see AWX for full output)"
+
+            # Create descriptive title
+            playbook_short = playbook_display.replace('.yml', '').replace('.yaml', '').replace('/', '-')
+
+            # Add error hints if failed
+            error_hint = ""
+            if final_status == "failed":
+                if "Permission denied" in output or "UNREACHABLE" in output:
+                    error_hint = (
+                        "\n\n💡 *Hint:* SSH authentication failed. "
+                        "Check that AWX has the correct SSH credential configured. "
+                        "Admin needs to set `AWX_CREDENTIAL_ID` in secrets."
+                    )
+                elif "No such file" in output:
+                    error_hint = "\n\n💡 *Hint:* Playbook file not found. Check the path."
+
             return MCPResult(
-                status=MCPResultStatus.SUCCESS,
+                status=MCPResultStatus.SUCCESS if final_status == "successful" else MCPResultStatus.ERROR,
                 message=(
-                    f"✅ *Job Launched*\n\n"
-                    f"*Job ID:* `{job_id}`\n"
-                    f"*Playbook:* `{playbook}`\n"
-                    f"*Inventory:* `{inventory_name}`\n"
-                    f"*Status:* `{job.get('status', 'pending')}`\n\n"
-                    f"*View in AWX:* <{job_url}|Open Job>\n\n"
-                    f"To check status: `job status {job_id}`\n"
-                    f"To view output: `job output {job_id}`\n\n"
+                    f"{status_emoji} *{playbook_short}* on `{inventory_name}`\n\n"
+                    f"*Status:* `{final_status}` | *Job:* `{job_id}` | *Hosts:* {host_count}\n"
+                    f"{error_hint}\n"
+                    f"*Output:*\n```\n{output}\n```\n\n"
+                    f"<{job_url}|View in AWX>\n\n"
                     f"_Ready for next task_"
                 ),
-                data={"job_id": job_id, "job": job}
+                data={"job_id": job_id, "status": final_status, "output": output}
             )
 
         except Exception as e:
@@ -450,6 +585,47 @@ class AwxPlaybookMCP(BaseMCP):
                 status=MCPResultStatus.ERROR,
                 message=f"❌ *Error executing playbook:* {str(e)}\n\n_Ready for next task_"
             )
+
+    async def _wait_for_job_completion(self, job_id: int, timeout: int = 300) -> tuple:
+        """Wait for job to complete and return (status, output)."""
+        import time
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            job = await self._get_job(job_id)
+            if not job:
+                return ("error", "Job not found")
+
+            status = job.get("status", "unknown")
+
+            # Check if job is done
+            if status in ["successful", "failed", "error", "canceled"]:
+                output = await self._get_job_output(job_id, lines=100)
+                return (status, output or "No output available")
+
+            # Wait before checking again
+            await asyncio.sleep(3)
+
+        # Timeout - get whatever output we have
+        output = await self._get_job_output(job_id, lines=50)
+        return ("timeout", output or "Job timed out waiting for completion")
+
+    async def _execute_playbook(
+        self,
+        playbook: str,
+        inventory_id: int,
+        inventory_name: str,
+        extra_vars: Optional[str] = None,
+    ) -> MCPResult:
+        """Execute a playbook on AWX (legacy, used by confirmed actions)."""
+        return await self._execute_playbook_with_streaming(
+            playbook=playbook,
+            playbook_display=playbook,
+            inventory_id=inventory_id,
+            inventory_name=inventory_name,
+            host_count=0,
+            extra_vars=extra_vars,
+        )
 
     async def _handle_job_status(self, parameters: Dict[str, Any]) -> MCPResult:
         """Get status of an AWX job."""
@@ -712,6 +888,255 @@ class AwxPlaybookMCP(BaseMCP):
             }
         )
 
+    async def _handle_show_playbook(self, parameters: Dict[str, Any]) -> MCPResult:
+        """Show details about a playbook (file or folder)."""
+        playbook = parameters.get("playbook", "").strip()
+
+        if not playbook:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    "⚠️ *Playbook name required*\n\n"
+                    "Usage: `show playbook <name>`\n"
+                    "Example: `show playbook check-service`\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        # Remove extension if provided
+        playbook_base = playbook.replace(".yml", "").replace(".yaml", "")
+
+        try:
+            # First check if it's a known playbook (file or folder)
+            playbooks = await self._fetch_playbooks_from_github()
+
+            # Find matching playbook
+            matching_pb = None
+            for pb in playbooks:
+                name = pb.get("name", "")
+                name_base = name.replace(".yml", "").replace(".yaml", "")
+                if name_base.lower() == playbook_base.lower():
+                    matching_pb = pb
+                    break
+
+            if not matching_pb:
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=(
+                        f"⚠️ *Playbook not found:* `{playbook}`\n\n"
+                        "Use `list playbooks` to see available playbooks.\n\n"
+                        "_Ready for next task_"
+                    )
+                )
+
+            pb_type = matching_pb.get("type", "file")
+            pb_name = matching_pb.get("name", "")
+
+            if pb_type == "folder":
+                # It's a folder - show contents
+                files = await self._fetch_playbook_files(pb_name)
+
+                if not files:
+                    return MCPResult(
+                        status=MCPResultStatus.SUCCESS,
+                        message=(
+                            f"📂 *Playbook Folder:* `{pb_name}/`\n\n"
+                            "_(empty folder)_\n\n"
+                            "_Ready for next task_"
+                        )
+                    )
+
+                lines = [f"📂 *Playbook Folder:* `{pb_name}/`\n"]
+                lines.append("*Contents:*")
+
+                yml_files = []
+                other_files = []
+                for f in files:
+                    name = f.get("name", "")
+                    ftype = f.get("type", "file")
+                    if name.endswith((".yml", ".yaml")):
+                        yml_files.append(f"  • `{name}` _(playbook)_")
+                    elif ftype == "dir":
+                        other_files.append(f"  • `{name}/` _(folder)_")
+                    else:
+                        other_files.append(f"  • `{name}`")
+
+                lines.extend(yml_files)
+                if other_files:
+                    lines.append("\n*Other files:*")
+                    lines.extend(other_files)
+
+                lines.append(f"\n*Total:* {len(yml_files)} playbook(s), {len(other_files)} other")
+                lines.append(f"\n_To run: `run playbook {pb_name}/<file> on <inventory>`_")
+                lines.append("\n_Ready for next task_")
+
+                return MCPResult(
+                    status=MCPResultStatus.SUCCESS,
+                    message="\n".join(lines),
+                    data={"playbook": pb_name, "type": "folder", "files": files}
+                )
+            else:
+                # It's a standalone file
+                return MCPResult(
+                    status=MCPResultStatus.SUCCESS,
+                    message=(
+                        f"📄 *Playbook File:* `{pb_name}`\n\n"
+                        f"This is a standalone playbook file.\n\n"
+                        f"_To run: `run playbook {playbook_base} on <inventory>`_\n\n"
+                        f"_Ready for next task_"
+                    ),
+                    data={"playbook": pb_name, "type": "file"}
+                )
+
+        except Exception as e:
+            logger.exception("Error showing playbook")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"❌ *Error:* {str(e)}\n\n_Ready for next task_"
+            )
+
+    async def _handle_setup_ssh(self) -> MCPResult:
+        """Check and display SSH credential status."""
+        try:
+            # Check if AWX_CREDENTIAL_ID is configured
+            if self.awx_credential_id:
+                # Verify the credential exists in AWX
+                cred_info = await self._get_credential(int(self.awx_credential_id))
+                if cred_info:
+                    return MCPResult(
+                        status=MCPResultStatus.SUCCESS,
+                        message=(
+                            f"✅ *SSH Credential Configured*\n\n"
+                            f"*Credential ID:* `{self.awx_credential_id}`\n"
+                            f"*Name:* `{cred_info.get('name', 'unknown')}`\n"
+                            f"*Type:* `{cred_info.get('credential_type_name', 'Machine')}`\n\n"
+                            f"SSH is ready for playbook execution.\n\n"
+                            f"_Ready for next task_"
+                        )
+                    )
+                else:
+                    return MCPResult(
+                        status=MCPResultStatus.ERROR,
+                        message=(
+                            f"⚠️ *SSH Credential Not Found*\n\n"
+                            f"Configured ID `{self.awx_credential_id}` does not exist in AWX.\n\n"
+                            f"*To fix:*\n"
+                            f"1. Go to AWX: http://{self.awx_server}/#/credentials\n"
+                            f"2. Create a 'Machine' credential with SSH key\n"
+                            f"3. Update `AWX_CREDENTIAL_ID` in K8s secrets\n\n"
+                            f"_Ready for next task_"
+                        )
+                    )
+            else:
+                # List existing SSH credentials
+                creds = await self._list_ssh_credentials()
+
+                if creds:
+                    cred_list = "\n".join([f"  • ID `{c['id']}`: {c['name']}" for c in creds])
+                    return MCPResult(
+                        status=MCPResultStatus.ERROR,
+                        message=(
+                            f"⚠️ *SSH Credential Not Configured*\n\n"
+                            f"AWX has these SSH credentials:\n{cred_list}\n\n"
+                            f"*To fix:*\n"
+                            f"Add to K8s secrets:\n"
+                            f"```\nkubectl patch secret slack-mcp-agent-secrets -p "
+                            f"'{{\"stringData\":{{\"AWX_CREDENTIAL_ID\":\"<id>\"}}}}'\n```\n"
+                            f"Then restart the pod.\n\n"
+                            f"_Ready for next task_"
+                        )
+                    )
+                else:
+                    return MCPResult(
+                        status=MCPResultStatus.ERROR,
+                        message=(
+                            f"⚠️ *No SSH Credentials in AWX*\n\n"
+                            f"*To fix:*\n"
+                            f"1. Go to AWX: http://{self.awx_server}/#/credentials\n"
+                            f"2. Click 'Add'\n"
+                            f"3. Select 'Machine' credential type\n"
+                            f"4. Enter name: `vivox-ssh-key`\n"
+                            f"5. Paste your SSH private key\n"
+                            f"6. Save and note the ID\n"
+                            f"7. Add to K8s secrets:\n"
+                            f"```\nkubectl patch secret slack-mcp-agent-secrets -p "
+                            f"'{{\"stringData\":{{\"AWX_CREDENTIAL_ID\":\"<id>\"}}}}'\n```\n\n"
+                            f"_Ready for next task_"
+                        )
+                    )
+
+        except Exception as e:
+            logger.exception("Error checking SSH setup")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"❌ *Error:* {str(e)}\n\n_Ready for next task_"
+            )
+
+    async def _get_credential(self, cred_id: int) -> Optional[Dict[str, Any]]:
+        """Get credential details from AWX."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                _executor,
+                self._get_credential_sync,
+                cred_id,
+            )
+        except Exception as e:
+            logger.error(f"Error getting credential: {e}")
+            return None
+
+    def _get_credential_sync(self, cred_id: int) -> Optional[Dict[str, Any]]:
+        """Synchronously get credential from AWX."""
+        url = f"http://{self.awx_server}/api/v2/credentials/{cred_id}/"
+        response = requests.get(
+            url,
+            auth=(self.awx_username, self.awx_password),
+            timeout=30
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    async def _list_ssh_credentials(self) -> List[Dict[str, Any]]:
+        """List SSH (Machine) credentials from AWX."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                _executor,
+                self._list_ssh_credentials_sync,
+            )
+        except Exception as e:
+            logger.error(f"Error listing credentials: {e}")
+            return []
+
+    def _list_ssh_credentials_sync(self) -> List[Dict[str, Any]]:
+        """Synchronously list SSH credentials from AWX."""
+        # First get Machine credential type ID
+        type_url = f"http://{self.awx_server}/api/v2/credential_types/"
+        type_response = requests.get(
+            type_url,
+            params={"name": "Machine"},
+            auth=(self.awx_username, self.awx_password),
+            timeout=30
+        )
+        type_response.raise_for_status()
+        types = type_response.json().get("results", [])
+        if not types:
+            return []
+        machine_type_id = types[0]["id"]
+
+        # Get credentials of that type
+        url = f"http://{self.awx_server}/api/v2/credentials/"
+        response = requests.get(
+            url,
+            params={"credential_type": machine_type_id},
+            auth=(self.awx_username, self.awx_password),
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json().get("results", [])
+
     # Helper methods
 
     def _get_status_emoji(self, status: str) -> str:
@@ -726,6 +1151,119 @@ class AwxPlaybookMCP(BaseMCP):
             "error": "❌",
         }
         return status_emojis.get(status.lower(), "❓")
+
+    def _format_ansible_output(self, output: str) -> str:
+        """Parse and format Ansible output for better Slack readability."""
+        import re
+
+        # Remove ANSI color codes if any
+        output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+
+        # Fix escaped newlines and quotes
+        output = output.replace('\\n', '\n').replace('\\"', '"')
+
+        # Extract key information
+        lines = output.split('\n')
+        formatted_lines = []
+        in_task = False
+        current_task = ""
+        services_found = []
+        hosts_summary = {}
+
+        for line in lines:
+            line = line.strip()
+
+            # Skip deprecation warnings and empty lines
+            if not line or '[DEPRECATION WARNING]' in line or line.startswith('deprecation_warnings'):
+                continue
+            if 'keyword is a more generic' in line or 'This feature will be removed' in line:
+                continue
+            if '[WARNING]: Invalid characters' in line or 'use -vvvv to see details' in line:
+                continue
+            if line.startswith('Identity added:'):
+                continue
+
+            # Capture PLAY name
+            if line.startswith('PLAY ['):
+                play_name = re.search(r'PLAY \[(.+?)\]', line)
+                if play_name:
+                    formatted_lines.append(f"▶️ {play_name.group(1)}")
+                continue
+
+            # Capture TASK name
+            if line.startswith('TASK ['):
+                task_name = re.search(r'TASK \[(.+?)\]', line)
+                if task_name:
+                    current_task = task_name.group(1)
+                    in_task = True
+                continue
+
+            # Capture task results
+            if line.startswith('ok:') or line.startswith('changed:'):
+                host = re.search(r'\[(.+?)\]', line)
+                if host:
+                    host_name = host.group(1)
+                    if host_name not in hosts_summary:
+                        hosts_summary[host_name] = {'ok': 0, 'changed': 0, 'failed': 0}
+                    if line.startswith('ok:'):
+                        hosts_summary[host_name]['ok'] += 1
+                    else:
+                        hosts_summary[host_name]['changed'] += 1
+                continue
+
+            if line.startswith('fatal:') or line.startswith('failed:'):
+                host = re.search(r'\[(.+?)\]', line)
+                if host:
+                    host_name = host.group(1)
+                    if host_name not in hosts_summary:
+                        hosts_summary[host_name] = {'ok': 0, 'changed': 0, 'failed': 0}
+                    hosts_summary[host_name]['failed'] += 1
+                    # Include error message
+                    formatted_lines.append(f"❌ {host_name}: {current_task}")
+                    # Try to extract error message
+                    error_match = re.search(r'"msg":\s*"(.+?)"', line)
+                    if error_match:
+                        formatted_lines.append(f"   Error: {error_match.group(1)[:200]}")
+                continue
+
+            if line.startswith('skipping:'):
+                continue
+
+            # Capture service status from our playbook output
+            if '"msg":' in line:
+                # Try to extract service information
+                msg_match = re.search(r'"msg":\s*"(.+)"', line)
+                if msg_match:
+                    msg = msg_match.group(1)
+                    # Look for service status patterns
+                    service_matches = re.findall(r'(\w+):\s*(active|inactive|failed|dead)', msg.lower())
+                    for svc, status in service_matches:
+                        emoji = "🟢" if status == "active" else "🔴"
+                        services_found.append(f"{emoji} {svc}: {status}")
+
+            # Capture PLAY RECAP
+            if line.startswith('PLAY RECAP'):
+                formatted_lines.append("\n📊 Summary:")
+                continue
+
+            # Parse recap lines
+            recap_match = re.match(r'^(\S+)\s+:\s+ok=(\d+)\s+changed=(\d+)\s+unreachable=(\d+)\s+failed=(\d+)', line)
+            if recap_match:
+                host, ok, changed, unreachable, failed = recap_match.groups()
+                status = "✅" if int(failed) == 0 and int(unreachable) == 0 else "❌"
+                formatted_lines.append(f"  {status} {host}: ok={ok}, changed={changed}, failed={failed}")
+
+        # Build final output
+        result = []
+
+        if formatted_lines:
+            result.extend(formatted_lines)
+
+        if services_found:
+            result.append("\n🔧 Services Detected:")
+            result.extend([f"  {s}" for s in services_found])
+
+        return '\n'.join(result) if result else output[:1000]
 
     async def _fetch_playbooks_from_github(self) -> List[Dict[str, Any]]:
         """Fetch list of playbooks from GitHub."""
@@ -765,15 +1303,74 @@ class AwxPlaybookMCP(BaseMCP):
 
         for item in contents:
             name = item.get("name", "")
-            if name.endswith((".yml", ".yaml")) and item.get("type") == "file":
+            item_type = item.get("type", "")
+
+            # Include directories (playbook folders) and yml files
+            if item_type == "dir":
+                # It's a playbook folder (like check-service/, harjo-setup/)
                 playbooks.append({
                     "name": name,
                     "path": item.get("path"),
                     "sha": item.get("sha"),
                     "url": item.get("html_url"),
+                    "type": "folder",
+                })
+            elif name.endswith((".yml", ".yaml")) and item_type == "file":
+                # It's a standalone playbook file
+                playbooks.append({
+                    "name": name,
+                    "path": item.get("path"),
+                    "sha": item.get("sha"),
+                    "url": item.get("html_url"),
+                    "type": "file",
                 })
 
         return playbooks
+
+    async def _fetch_playbook_files(self, playbook_name: str) -> List[Dict[str, Any]]:
+        """Fetch files inside a playbook folder."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                _executor,
+                self._fetch_playbook_files_sync,
+                playbook_name,
+            )
+        except Exception as e:
+            logger.error(f"Error fetching playbook files: {e}")
+            return []
+
+    def _fetch_playbook_files_sync(self, playbook_name: str) -> List[Dict[str, Any]]:
+        """Synchronously fetch files from a playbook folder."""
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        if self.github_token:
+            headers["Authorization"] = f"token {self.github_token}"
+
+        # Get contents of the playbook folder
+        folder_path = f"{self.github_path}/{playbook_name}"
+        url = f"{self.github_api_url}/repos/{self.github_repo}/contents/{folder_path}"
+        params = {"ref": self.github_branch}
+
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 404:
+            return []
+
+        response.raise_for_status()
+
+        contents = response.json()
+        files = []
+
+        for item in contents:
+            files.append({
+                "name": item.get("name", ""),
+                "path": item.get("path"),
+                "type": item.get("type", "file"),
+                "sha": item.get("sha"),
+                "url": item.get("html_url"),
+            })
+
+        return files
 
     async def _get_inventory(self, name: str) -> Optional[Dict[str, Any]]:
         """Get inventory by name from AWX."""
@@ -1019,8 +1616,9 @@ class AwxPlaybookMCP(BaseMCP):
         inventory_id: int,
     ) -> Optional[int]:
         """Synchronously ensure job template exists."""
-        # Template name based on playbook
-        template_name = f"slack-bot-{playbook.replace('.yml', '').replace('.yaml', '')}"
+        # Template name based on playbook - make it descriptive
+        playbook_base = playbook.replace('.yml', '').replace('.yaml', '').replace('/', '-')
+        template_name = f"slack-bot-{playbook_base}"
 
         # Check if template exists
         url = f"http://{self.awx_server}/api/v2/job_templates/"
@@ -1035,16 +1633,38 @@ class AwxPlaybookMCP(BaseMCP):
         results = response.json().get("results", [])
         if results:
             template = results[0]
+            template_id = template["id"]
+
             # Update inventory if different
             if template.get("inventory") != inventory_id:
-                update_url = f"http://{self.awx_server}/api/v2/job_templates/{template['id']}/"
+                update_url = f"http://{self.awx_server}/api/v2/job_templates/{template_id}/"
                 requests.patch(
                     update_url,
                     json={"inventory": inventory_id},
                     auth=(self.awx_username, self.awx_password),
                     timeout=30
                 )
-            return template["id"]
+
+            # Ensure credential is attached (AWX uses separate endpoint)
+            if self.awx_credential_id:
+                existing_creds = template.get("summary_fields", {}).get("credentials", [])
+                cred_ids = [c.get("id") for c in existing_creds]
+                cred_id = int(self.awx_credential_id)
+
+                if cred_id not in cred_ids:
+                    cred_url = f"http://{self.awx_server}/api/v2/job_templates/{template_id}/credentials/"
+                    try:
+                        requests.post(
+                            cred_url,
+                            json={"id": cred_id},
+                            auth=(self.awx_username, self.awx_password),
+                            timeout=30
+                        )
+                        logger.info(f"Attached credential {cred_id} to existing template {template_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to attach credential: {e}")
+
+            return template_id
 
         # Create template
         playbook_path = f"{self.github_path}/{playbook}"
@@ -1059,10 +1679,6 @@ class AwxPlaybookMCP(BaseMCP):
             "ask_variables_on_launch": True,
         }
 
-        # Add credential if configured
-        if self.awx_credential_id:
-            payload["credential"] = int(self.awx_credential_id)
-
         response = requests.post(
             url,
             json=payload,
@@ -1071,7 +1687,23 @@ class AwxPlaybookMCP(BaseMCP):
         )
         response.raise_for_status()
 
-        return response.json().get("id")
+        template_id = response.json().get("id")
+
+        # Attach credential via separate endpoint (AWX requires this)
+        if self.awx_credential_id and template_id:
+            cred_url = f"http://{self.awx_server}/api/v2/job_templates/{template_id}/credentials/"
+            try:
+                requests.post(
+                    cred_url,
+                    json={"id": int(self.awx_credential_id)},
+                    auth=(self.awx_username, self.awx_password),
+                    timeout=30
+                )
+                logger.info(f"Attached credential {self.awx_credential_id} to template {template_id}")
+            except Exception as e:
+                logger.warning(f"Failed to attach credential: {e}")
+
+        return template_id
 
     async def _launch_job(
         self,
