@@ -5,10 +5,13 @@ import asyncio
 import time
 import logging
 import requests
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from ..base import BaseMCP, MCPAction, MCPResult, MCPResultStatus
+from ...request_queue import (
+    RequestQueue, PlaybookRequest, RequestPriority, RequestStatus, get_queue
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +25,13 @@ class AwxPlaybookMCP(BaseMCP):
 
     This MCP provides actions to:
     - List playbooks from GitHub
-    - Run playbooks on inventories
+    - Run playbooks on inventories (with queue management)
     - Check job status
     - View job output
+    - Manage request queue
     """
 
-    def __init__(self):
+    def __init__(self, notify_callback: Optional[Callable] = None):
         # AWX configuration
         self.awx_server = os.environ.get("AWX_SERVER", "localhost")
         self.awx_username = os.environ.get("AWX_USERNAME")
@@ -56,7 +60,29 @@ class AwxPlaybookMCP(BaseMCP):
         # Track AWX project ID (created once)
         self._awx_project_id: Optional[int] = None
 
+        # Request queue for multi-user handling
+        self._notify_callback = notify_callback
+        self._queue: Optional[RequestQueue] = None
+        self._queue_enabled = os.environ.get("ENABLE_QUEUE", "true").lower() == "true"
+
         super().__init__()
+
+    async def initialize_queue(self, notify_callback: Callable):
+        """Initialize the request queue with a notification callback."""
+        self._notify_callback = notify_callback
+        self._queue = get_queue()
+        self._queue.notify_callback = notify_callback
+
+        # Set up executor that calls our internal method
+        async def queue_executor(playbook, inventory, extra_vars, user_id, channel_id):
+            return await self._execute_playbook_internal(
+                playbook=playbook,
+                inventory=inventory,
+                extra_vars=extra_vars,
+            )
+
+        await self._queue.start(queue_executor)
+        logger.info("AWX Playbook queue initialized")
 
     @property
     def name(self) -> str:
@@ -249,6 +275,49 @@ class AwxPlaybookMCP(BaseMCP):
             ],
         ))
 
+        # Queue management actions
+        self.register_action(MCPAction(
+            name="queue-status",
+            description="Show the current request queue status",
+            parameters=[],
+            requires_confirmation=False,
+            examples=[
+                "queue status",
+                "show queue",
+                "what's running",
+            ],
+        ))
+
+        self.register_action(MCPAction(
+            name="my-requests",
+            description="Show your recent requests",
+            parameters=[],
+            requires_confirmation=False,
+            examples=[
+                "my requests",
+                "my jobs",
+                "show my requests",
+            ],
+        ))
+
+        self.register_action(MCPAction(
+            name="cancel-request",
+            description="Cancel a pending request",
+            parameters=[
+                {
+                    "name": "request_id",
+                    "type": "string",
+                    "description": "Request ID to cancel",
+                    "required": True,
+                },
+            ],
+            requires_confirmation=False,
+            examples=[
+                "cancel request abc123",
+                "cancel abc123",
+            ],
+        ))
+
     async def execute(
         self,
         action: str,
@@ -277,6 +346,12 @@ class AwxPlaybookMCP(BaseMCP):
             return await self._handle_show_playbook(parameters)
         elif action == "setup-ssh":
             return await self._handle_setup_ssh()
+        elif action == "queue-status":
+            return await self._handle_queue_status()
+        elif action == "my-requests":
+            return await self._handle_my_requests(user_id)
+        elif action == "cancel-request":
+            return await self._handle_cancel_request(parameters, user_id)
         else:
             return MCPResult(
                 status=MCPResultStatus.ERROR,
@@ -464,7 +539,37 @@ class AwxPlaybookMCP(BaseMCP):
         inv_id = inventory_info.get("id")
         host_count = inventory_info.get("total_hosts", 0)
 
-        # Run immediately without confirmation (user already asked to run)
+        # Check if queue is enabled and initialized
+        if self._queue_enabled and self._queue:
+            # Submit to queue for multi-user handling
+            # Parse extra_vars if provided
+            extra_vars_dict = {}
+            if extra_vars:
+                try:
+                    import json
+                    extra_vars_dict = json.loads(extra_vars) if isinstance(extra_vars, str) else extra_vars
+                except json.JSONDecodeError:
+                    pass
+
+            request = PlaybookRequest.create(
+                user_id=user_id,
+                user_name=user_id,  # Will be user ID, Slack can resolve to name later
+                channel_id=channel_id,
+                playbook=playbook_path,
+                inventory=inventory,
+                extra_vars=extra_vars_dict,
+                priority=RequestPriority.NORMAL,
+            )
+
+            success, message = await self._queue.submit(request)
+
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS if success else MCPResultStatus.ERROR,
+                message=message,
+                data={"request_id": request.id if success else None}
+            )
+
+        # Run immediately without queue (direct execution)
         return await self._execute_playbook_with_streaming(
             playbook=playbook_path,
             playbook_display=playbook_display,
@@ -994,6 +1099,123 @@ class AwxPlaybookMCP(BaseMCP):
                 status=MCPResultStatus.ERROR,
                 message=f"❌ *Error:* {str(e)}\n\n_Ready for next task_"
             )
+
+    async def _handle_queue_status(self) -> MCPResult:
+        """Get current queue status."""
+        if not self._queue:
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS,
+                message=(
+                    "📊 *Queue Status*\n\n"
+                    "Queue is not enabled. Running playbooks directly.\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        try:
+            status_msg = await self._queue.get_status()
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS,
+                message=f"{status_msg}\n\n_Ready for next task_"
+            )
+        except Exception as e:
+            logger.exception("Error getting queue status")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"❌ *Error getting queue status:* {str(e)}\n\n_Ready for next task_"
+            )
+
+    async def _handle_my_requests(self, user_id: str) -> MCPResult:
+        """Get user's recent requests."""
+        if not self._queue:
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS,
+                message=(
+                    "📋 *Your Requests*\n\n"
+                    "Queue is not enabled. No request tracking available.\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        try:
+            requests_msg = await self._queue.get_user_requests(user_id)
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS,
+                message=f"{requests_msg}\n\n_Ready for next task_"
+            )
+        except Exception as e:
+            logger.exception("Error getting user requests")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"❌ *Error getting your requests:* {str(e)}\n\n_Ready for next task_"
+            )
+
+    async def _handle_cancel_request(self, parameters: Dict[str, Any], user_id: str) -> MCPResult:
+        """Cancel a pending request."""
+        request_id = parameters.get("request_id", "").strip()
+
+        if not request_id:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    "⚠️ *Request ID required*\n\n"
+                    "Usage: `cancel request <request_id>`\n"
+                    "Use `my requests` to see your pending requests.\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        if not self._queue:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message="Queue is not enabled.\n\n_Ready for next task_"
+            )
+
+        try:
+            success, message = await self._queue.cancel(request_id, user_id)
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS if success else MCPResultStatus.ERROR,
+                message=f"{message}\n\n_Ready for next task_"
+            )
+        except Exception as e:
+            logger.exception("Error canceling request")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"❌ *Error canceling request:* {str(e)}\n\n_Ready for next task_"
+            )
+
+    async def _execute_playbook_internal(
+        self,
+        playbook: str,
+        inventory: str,
+        extra_vars: Optional[Dict[str, Any]] = None,
+    ) -> MCPResult:
+        """Execute playbook internally (used by queue executor)."""
+        # Get inventory info
+        inventory_info = await self._get_inventory(inventory)
+        if not inventory_info:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"❌ Unknown inventory: `{inventory}`"
+            )
+
+        inv_id = inventory_info.get("id")
+        host_count = inventory_info.get("total_hosts", 0)
+
+        # Convert extra_vars dict to JSON string if needed
+        extra_vars_str = None
+        if extra_vars:
+            import json
+            extra_vars_str = json.dumps(extra_vars)
+
+        return await self._execute_playbook_with_streaming(
+            playbook=playbook,
+            playbook_display=playbook,
+            inventory_id=inv_id,
+            inventory_name=inventory,
+            host_count=host_count,
+            extra_vars=extra_vars_str,
+        )
 
     async def _handle_setup_ssh(self) -> MCPResult:
         """Check and display SSH credential status."""

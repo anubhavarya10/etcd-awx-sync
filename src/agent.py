@@ -295,13 +295,25 @@ I'm an AI-powered assistant that can help you manage infrastructure operations.
 
 *How to use:*
 - Just describe what you want to do in natural language
-- I'll figure out which tool to use and confirm before taking action
+- I'll figure out which tool to use and run it
 
-*Example commands:*
+*Inventory Commands:*
 - `sync all inventory from etcd to awx`
 - `create inventory for mphpp servers in pubwxp`
 - `list available domains`
 - `list roles`
+
+*Playbook Commands:*
+- `list playbooks` - Show available playbooks
+- `show playbook <name>` - See files in a playbook folder
+- `run playbook <name> on <inventory>` - Execute a playbook
+- `job status <id>` - Check job status
+- `list jobs` - Show recent jobs
+
+*Queue Commands:* (multi-user support)
+- `queue status` - See what's running and queued
+- `my requests` - Show your recent requests
+- `cancel request <id>` - Cancel a pending request
 
 {mcp_list}
 
@@ -314,8 +326,34 @@ I'm an AI-powered assistant that can help you manage infrastructure operations.
 Need more help? Just ask!
 """
 
+    async def _notify_channel(self, channel_id: str, message: str):
+        """Send a notification message to a channel (used by queue)."""
+        try:
+            client = self.app.client
+            await client.chat_postMessage(
+                channel=channel_id,
+                text=message,
+                mrkdwn=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send notification to {channel_id}: {e}")
+
+    async def _initialize_queue(self):
+        """Initialize the request queue for the AWX playbook MCP."""
+        try:
+            # Get the AWX playbook MCP
+            awx_mcp = self.registry.get("awx-playbook")
+            if awx_mcp and hasattr(awx_mcp, 'initialize_queue'):
+                await awx_mcp.initialize_queue(self._notify_channel)
+                logger.info("Request queue initialized for AWX playbook MCP")
+        except Exception as e:
+            logger.error(f"Failed to initialize queue: {e}")
+
     async def start(self):
         """Start the Slack agent."""
+        # Initialize queue for multi-user support
+        await self._initialize_queue()
+
         handler = AsyncSocketModeHandler(self.app, self.config.slack_app_token)
         logger.info("Starting Slack MCP Agent in Socket Mode...")
         await handler.start_async()

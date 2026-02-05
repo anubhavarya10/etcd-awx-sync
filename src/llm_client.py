@@ -401,6 +401,59 @@ class MockLLMClient(BaseLLMClient):
                 model="mock",
             )
 
+        # === QUEUE COMMANDS ===
+        has_queue = any(matches(w, ['queue', 'queued']) for w in words)
+        has_my = any(matches(w, ['my', 'mine']) for w in words)
+        has_request = any(matches(w, ['request', 'requests']) for w in words)
+        has_cancel = any(matches(w, ['cancel', 'stop', 'abort', 'remove']) for w in words)
+        has_running = any(matches(w, ['running', 'active', 'pending', 'waiting']) for w in words)
+
+        # Cancel request - "cancel request abc123", "cancel abc123"
+        if has_cancel and (has_request or potential_terms):
+            request_id = None
+            for term in potential_terms:
+                # Request IDs are typically 8 chars
+                if len(term) >= 6 and len(term) <= 12:
+                    request_id = term
+                    break
+            if request_id:
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "awx-playbook",
+                        "action": "cancel-request",
+                        "parameters": {"request_id": request_id},
+                        "confidence": 0.95,
+                        "explanation": f"Cancel request {request_id}"
+                    }),
+                    model="mock",
+                )
+
+        # My requests - "my requests", "my jobs", "show my requests"
+        if has_my and (has_request or has_job):
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "awx-playbook",
+                    "action": "my-requests",
+                    "parameters": {},
+                    "confidence": 0.95,
+                    "explanation": "Show user's requests"
+                }),
+                model="mock",
+            )
+
+        # Queue status - "queue status", "show queue", "what's running", "what's in queue"
+        if has_queue or (has_running and not has_run):
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "awx-playbook",
+                    "action": "queue-status",
+                    "parameters": {},
+                    "confidence": 0.95,
+                    "explanation": "Show queue status"
+                }),
+                model="mock",
+            )
+
         # === SSH/CREDENTIAL COMMANDS ===
         has_ssh = any(matches(w, ['ssh', 'credential', 'credentials', 'key']) for w in words)
         has_setup = any(matches(w, ['setup', 'check', 'configure', 'status']) for w in words)
