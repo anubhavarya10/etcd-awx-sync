@@ -489,18 +489,39 @@ class AwxPlaybookMCP(BaseMCP):
                 playbook_path = f"{folder_match}/{yml_files[0]['name']}"
                 playbook_display = playbook_path
             else:
-                # Multiple playbooks - ask user to specify
-                file_list = "\n".join([f"  • `{folder_match}/{f['name']}`" for f in yml_files])
-                return MCPResult(
-                    status=MCPResultStatus.ERROR,
-                    message=(
-                        f"📂 *Multiple playbooks in folder:* `{folder_match}/`\n\n"
-                        f"{file_list}\n\n"
-                        f"Please specify which one:\n"
-                        f"`run playbook {folder_match}/<filename>.yml on {inventory}`\n\n"
-                        "_Ready for next task_"
+                # Multiple playbooks - try to find the best match
+                main_playbook = None
+                yml_names = [f.get("name", "") for f in yml_files]
+
+                # Priority 1: File matching folder name (e.g., morpheus-mphpp-setup.yml)
+                for name in yml_names:
+                    if name.replace(".yml", "").replace(".yaml", "") == folder_match:
+                        main_playbook = name
+                        break
+
+                # Priority 2: Common main entry points
+                if not main_playbook:
+                    for common_name in ["main.yml", "site.yml", "playbook.yml", "setup.yml"]:
+                        if common_name in yml_names:
+                            main_playbook = common_name
+                            break
+
+                if main_playbook:
+                    playbook_path = f"{folder_match}/{main_playbook}"
+                    playbook_display = playbook_path
+                else:
+                    # Can't determine - ask user to specify
+                    file_list = "\n".join([f"  • `{folder_match}/{f['name']}`" for f in yml_files])
+                    return MCPResult(
+                        status=MCPResultStatus.ERROR,
+                        message=(
+                            f"📂 *Multiple playbooks in folder:* `{folder_match}/`\n\n"
+                            f"{file_list}\n\n"
+                            f"Please specify which one:\n"
+                            f"`run playbook {folder_match}/<filename>.yml on {inventory}`\n\n"
+                            "_Ready for next task_"
+                        )
                     )
-                )
         elif file_match:
             playbook_path = file_match
             playbook_display = file_match
