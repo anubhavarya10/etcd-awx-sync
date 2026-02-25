@@ -1,0 +1,17 @@
+---
+version: 3
+
+build_arg_defaults:
+  ANSIBLE_GALAXY_CLI_COLLECTION_OPTS: '--pre'
+
+dependencies:
+  galaxy: requirements.yml
+  python: requirements.txt
+  system: bindep.txt
+
+images:
+  base_image:
+    name: quay.io/ansible/awx-ee:latest
+
+options:
+  package_manager_path: /usr/bin/dnf
