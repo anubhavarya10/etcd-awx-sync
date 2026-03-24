@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: service-manager-config
+  labels:
+    app: service-manager
+data:
+  # etcd Configuration
+  ETCD_SERVER: "10.0.25.44"
+  ETCD_PORT: "2379"
+  ETCD_PREFIX: "/discovery/"
+
+  # Service port
+  PORT: "8081"
+
+  # Logging
+  LOG_LEVEL: "INFO"
+
+  # SSH key path (mounted from secret)
+  SSH_KEY_PATH: "/app/ssh/id_rsa"
+
+  # AWX Configuration (for Azure hosts routed via AWX ad-hoc API)
+  AWX_SERVER: "awx.vivox.com"
+  AWX_USERNAME: "admin"
+  AWX_CREDENTIAL_ID: "5"
+  AWX_EE_ID: "4"

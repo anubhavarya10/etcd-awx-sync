@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-monitor
+  labels:
+    app: pod-monitor
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-monitor-reader
+  labels:
+    app: pod-monitor
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-monitor-reader-binding
+  labels:
+    app: pod-monitor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-monitor-reader
+subjects:
+  - kind: ServiceAccount
+    name: pod-monitor
+    namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-monitor
+  labels:
+    app: pod-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-monitor
+  template:
+    metadata:
+      labels:
+        app: pod-monitor
+    spec:
+      serviceAccountName: pod-monitor
+      imagePullSecrets:
+        - name: gcr-secret
+      containers:
+        - name: pod-monitor
+          image: us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/pod-monitor:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8082
+              name: http
+          envFrom:
+            - configMapRef:
+                name: pod-monitor-config
+            - secretRef:
+                name: pod-monitor-secrets
+                optional: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pod-monitor
+  labels:
+    app: pod-monitor
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8082
+      targetPort: http
+      name: http
+  selector:
+    app: pod-monitor

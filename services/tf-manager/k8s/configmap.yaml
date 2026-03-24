@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tf-manager-config
+  labels:
+    app: tf-manager
+data:
+  # Terraform Cloud
+  TFC_ORG: "unity-technologies"
+
+  # Git repo
+  TF_REPO_URL: "https://github.com/Unity-Technologies/vivox-ops-openstack.git"
+  TF_REPO_BRANCH: "main"
+
+  # OpenStack query (SSH through jump host)
+  OPENSTACK_JUMP_HOST: "10.0.25.10"
+  OPENSTACK_HOST: "ostack2-osa"
+  SSH_USERNAME: "root"
+
+  # Service port
+  PORT: "8083"
+
+  # Logging
+  LOG_LEVEL: "INFO"

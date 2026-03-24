@@ -275,7 +275,7 @@ class SlackMCPAgent:
                     respond=say,
                 )
 
-        @self.app.action(re.compile(r"confirm_.*"))
+        @self.app.action(re.compile(r"^confirm_.*"))
         async def handle_confirm(ack, action, body, client, respond):
             """Handle confirmation button clicks - silently ignore old buttons."""
             await ack()
@@ -283,7 +283,7 @@ class SlackMCPAgent:
             # This prevents confusing "expired" messages from appearing
             logger.debug(f"Ignored old confirm button: {action.get('value')}")
 
-        @self.app.action(re.compile(r"cancel_.*"))
+        @self.app.action(re.compile(r"^cancel_.*"))
         async def handle_cancel(ack, action, body, client, respond):
             """Handle cancel button clicks - silently ignore old buttons."""
             await ack()

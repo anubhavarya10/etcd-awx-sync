@@ -1,0 +1,11 @@
+# HTTP server
+aiohttp>=3.8.0
+
+# Kubernetes client
+kubernetes>=28.1.0
+
+# HTTP client for Slack webhooks (fallback)
+httpx>=0.25.0
+
+# Slack Web API client (for Block Kit alerts with threading)
+slack_sdk>=3.21.0

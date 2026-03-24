@@ -1,0 +1,11 @@
+# HTTP server
+aiohttp>=3.8.0
+
+# HTTP client for Terraform Cloud API
+httpx>=0.24.0
+
+# Git operations
+gitpython>=3.1.0
+
+# SSH for OpenStack server queries
+asyncssh>=2.13.0

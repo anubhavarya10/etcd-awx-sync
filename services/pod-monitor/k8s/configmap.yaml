@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-monitor-config
+  labels:
+    app: pod-monitor
+data:
+  # Service port
+  PORT: "8082"
+
+  # Logging
+  LOG_LEVEL: "INFO"
+
+  # Alerting configuration
+  ALERTING_ENABLED: "true"
+  ALERT_NAMESPACE: "default"
+  ALERT_CHECK_INTERVAL: "120"
+  ALERT_COOLDOWN: "3600"
+
+  # Slack channel for pod alerts (Block Kit messages with buttons)
+  SLACK_ALERT_CHANNEL_ID: "C08FQQK2N6R"

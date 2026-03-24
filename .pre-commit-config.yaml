@@ -1,0 +1,47 @@
+# Pre-commit hooks for playbook validation
+# Install: pip install pre-commit && pre-commit install
+
+repos:
+  # YAML Linting
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.33.0
+    hooks:
+      - id: yamllint
+        name: Lint YAML files
+        files: \.(yml|yaml)$
+        args: ['-c', '.yamllint.yml']
+
+  # Ansible Syntax Check
+  - repo: https://github.com/ansible/ansible-lint
+    rev: v24.2.0
+    hooks:
+      - id: ansible-lint
+        name: Ansible Lint
+        files: ^(playbooks|ansible)/.*\.(yml|yaml)$
+        args: ['--offline']
+
+  # Custom Playbook Validator
+  - repo: local
+    hooks:
+      - id: playbook-validator
+        name: Playbook Standards Validator
+        entry: python scripts/playbook_validator.py
+        language: python
+        files: ^(playbooks|ansible)/.*\.(yml|yaml)$
+        additional_dependencies: ['pyyaml']
+        pass_filenames: true
+
+  # General checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        files: \.(yml|yaml|md)$
+      - id: end-of-file-fixer
+        files: \.(yml|yaml|md)$
+      - id: check-yaml
+        files: \.(yml|yaml)$
+        args: ['--unsafe']  # Allow custom tags
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: detect-private-key

@@ -1,0 +1,57 @@
+# YAML Lint configuration for playbooks
+extends: default
+
+rules:
+  # Allow longer lines for readability
+  line-length:
+    max: 200
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+
+  # Allow common Ansible boolean values
+  truthy:
+    allowed-values: ['true', 'false', 'yes', 'no', 'True', 'False', 'Yes', 'No']
+
+  # Comments spacing
+  comments:
+    min-spaces-from-content: 1
+    require-starting-space: true
+
+  # Indentation (Ansible standard)
+  indentation:
+    spaces: 2
+    indent-sequences: true
+    check-multi-line-strings: false
+
+  # Braces spacing
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+
+  # Brackets spacing
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+
+  # Empty lines
+  empty-lines:
+    max: 2
+    max-start: 0
+    max-end: 1
+
+  # Document markers
+  document-start: disable
+  document-end: disable
+
+  # Allow colons in comments (common in URLs)
+  colons:
+    max-spaces-before: 0
+    max-spaces-after: -1
+
+# Ignore directories
+ignore: |
+  .github/
+  .venv/
+  venv/
+  node_modules/
+  collections/
