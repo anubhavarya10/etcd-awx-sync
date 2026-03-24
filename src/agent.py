@@ -452,8 +452,9 @@ class SlackMCPAgent:
             await respond(text=f":warning: Could not parse command: `{text}`\n\n{self._get_svc_help_message()}")
             return
 
-        # Two-step confirmation for critical role restarts
-        if action == 'restart-service' and role in RESTART_CONFIRM_ROLES:
+        # Confirmation for all restarts
+        if action == 'restart-service':
+            two_step = role in RESTART_CONFIRM_ROLES
             await self._initiate_restart_confirmation(
                 role=role,
                 domain=domain,
@@ -461,6 +462,7 @@ class SlackMCPAgent:
                 user_id=user_id,
                 channel_id=channel_id,
                 client=client,
+                two_step=two_step,
             )
             return
 
@@ -530,8 +532,9 @@ Check and manage services on servers via direct SSH.
         user_id: str,
         channel_id: str,
         client: AsyncWebClient,
+        two_step: bool = False,
     ):
-        """Step 1: Post confirmation prompt asking if user really wants to restart."""
+        """Post confirmation prompt. two_step=True adds a notification choice (critical roles)."""
         self._cleanup_stale_restarts()
 
         service_name = ROLE_DISPLAY_NAMES.get(role, role)
@@ -569,7 +572,12 @@ Check and manage services on servers via direct SSH.
             "channel_id": channel_id,
             "message_ts": None,  # set after posting
             "created_at": time.time(),
+            "two_step": two_step,
         }
+
+        # For two_step (critical roles): Yes goes to step 2 (notification choice)
+        # For single-step (other roles): Yes goes straight to restart
+        yes_action_id = f"svc_confirm_{restart_id}" if two_step else f"svc_restart_only_{restart_id}"
 
         blocks = [
             {
@@ -589,7 +597,7 @@ Check and manage services on servers via direct SSH.
                         "type": "button",
                         "text": {"type": "plain_text", "text": "Yes"},
                         "style": "danger",
-                        "action_id": f"svc_confirm_{restart_id}",
+                        "action_id": yes_action_id,
                         "value": restart_id,
                     },
                     {
