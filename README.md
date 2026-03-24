@@ -1,293 +1,203 @@
-# etcd to AWX Inventory Sync
+# vops-bot
 
-A Python script that synchronizes host information from etcd to AWX (Ansible Tower) inventory with smart filtering and natural language support.
+Slack-based infrastructure operations bot for managing services, running Ansible playbooks, scaling OpenStack resources, and monitoring Kubernetes pods. Built as a set of independently deployable microservices that the main bot auto-discovers at startup.
 
-## Features
+## Architecture
 
-- **Dynamic Discovery**: Automatically discovers all domains and roles from etcd (no hardcoded lists)
-- **Smart Prompt Mode**: Create inventories using natural language (e.g., "mphpp servers for pubwxp")
-- **Flexible Filtering**: Filter by domain, role, or both with exact matching
-- **Auto Host Groups**: Creates groups based on customer, role, location, and cluster patterns
-- **Multiple Auth Methods**: Supports OAuth2, Personal Access Token, and Basic auth
-- **Idempotent**: Safe to run multiple times - updates existing hosts
+```
+┌─────────────────────────────────────────────────────┐
+│                    Slack (Socket Mode)               │
+└──────────────────────┬──────────────────────────────┘
+                       │
+              ┌────────▼────────┐
+              │  slack-mcp-agent │  ← Main bot, routes commands
+              │    (port 8080)   │
+              └──┬─────┬─────┬──┘
+                 │     │     │
+        ┌────────▼┐ ┌──▼───┐ ┌▼──────────┐
+        │ service- │ │ pod- │ │    tf-     │
+        │ manager  │ │monit.│ │  manager   │
+        │ (8081)   │ │(8082)│ │  (8083)    │
+        └──┬───┬───┘ └──┬───┘ └──┬────┬───┘
+           │   │        │        │    │
+        ┌──▼┐ ┌▼──┐  ┌──▼──┐ ┌──▼┐ ┌─▼──┐
+        │SSH│ │AWX│  │K8s  │ │TFC│ │Git │
+        │   │ │API│  │ API │ │API│ │Hub │
+        └───┘ └───┘  └─────┘ └───┘ └────┘
+              etcd ◄──── host discovery
+```
 
-## Current Statistics
+The system follows the **MCP pattern**. Each microservice exposes a `/info` endpoint describing its available actions and parameters. The main bot discovers these at startup via environment variables (`REMOTE_MCP_SERVICE_MANAGER=http://service-manager:8081`, etc.), calls `/info` on each, and builds a routing table. When a Slack command arrives, the bot routes it to the correct service over HTTP. Services can be added, removed, or restarted independently without affecting each other.
 
-| Metric | Count |
-|--------|-------|
-| Total Hosts | ~2,800+ |
-| Domains/Customers | 142 |
-| Discovered Roles | 56 |
+## Services
 
-Top roles: `mphpp` (915), `os` (335), `mim` (286), `www` (241), `mphhos` (140), `ts` (127)
+### slack-mcp-agent (Main Bot)
 
-## Quick Start
+The central orchestrator. Connects to Slack via Socket Mode, receives slash commands (`/svc`, `/awx`, `/tf`, `/pods`), parses user intent, routes requests to the appropriate microservice, and posts results back to Slack. Also handles interactive button callbacks (pod alert actions, Terraform confirm/cancel).
+
+- **Port:** 8080
+- **Key files:** `main.py`, `src/agent.py`, `src/llm_client.py`, `src/request_queue.py`
+- **Image:** `us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/slack-mcp-agent:latest`
+
+### service-manager
+
+Manages services across hosts via SSH. Queries **etcd** to discover hosts by role and domain, opens concurrent SSH connections, and runs `systemctl` commands in parallel. For Azure hosts (IP range `10.253.x.x`), routes commands through the **AWX ad-hoc API** instead of direct SSH due to network constraints.
+
+- **Port:** 8081
+- **Key files:** `services/service-manager/src/mcp.py`, `src/ssh_client.py`, `src/awx_client.py`
+- **Host discovery:** etcd at `10.0.25.44:2379` — no hardcoded host lists; hosts are available immediately when added to etcd
+- **SSH auth:** `root` + password for regular hosts, `vivoxops` + password + sudo for Azure hosts
+
+**Supported actions:** `check-service`, `restart-service`, `start-service`, `stop-service`, `service-logs`, `get-version`, `list-service-roles`
+
+**Supported roles:** mim, mphpp, mphhos, ts, www, www5, ngx, ngxint, redis, mongodb, tps, harjo, hamim, haweb, srouter, sdecoder, scapture, ser, sconductor, mimmem, provnstatdb5
+
+### pod-monitor
+
+Monitors Kubernetes pod health and provides both active queries and passive alerting.
+
+- **Port:** 8082
+- **Key files:** `services/pod-monitor/src/mcp.py`, `src/k8s_client.py`, `src/alerter.py`
+- **RBAC:** Uses a `pod-monitor` ServiceAccount with read-only ClusterRole for pods, logs, events, and metrics
+
+**Active actions:** `list-pods`, `pod-details`, `pod-logs`, `unhealthy-pods`, `namespace-summary`
+
+**Passive alerting:** A background task checks pod health every 2 minutes. Detected conditions include CrashLoopBackOff, OOMKilled, high restarts (only if the last restart was within 30 minutes), stuck Pending (>5 min), ImagePullBackOff, and not-ready (>5 min, using the `Ready` condition's `lastTransitionTime`).
+
+Alerts use the **Slack Web API** with Block Kit messages. The first alert for an issue posts a message with interactive buttons (Resolve, Pause 1d, Pause 1w). Subsequent alerts for the same issue are posted as **threaded replies** under the original message. When a pod self-heals, the alerter posts "Auto-resolved" in the thread. Button clicks are handled by `slack-mcp-agent`, which calls pod-monitor's HTTP endpoints (`/alert/resolve`, `/alert/pause`) to update alert state.
+
+### tf-manager
+
+Manages Terraform-driven OpenStack scaling. Handles the full lifecycle: git pull, `.tf` file modification, commit and push, Terraform Cloud plan polling (including Sentinel policies), user confirmation via Slack buttons, TFC apply, and post-apply verification by SSHing through a jump host to query OpenStack for actual server IPs.
+
+- **Port:** 8083
+- **Key files:** `services/tf-manager/src/mcp.py`, `src/tfc_client.py`, `src/tf_parser.py`, `src/git_client.py`, `src/openstack_client.py`
+
+**Supported actions:** `add-servers`, `remove-servers`, `confirm-apply`, `cancel-run`, `show-domain`, `list-domains`
+
+## Commands
+
+### `/svc` — Service Management
+
+```
+/svc check mim in lionamxp        # Check service status across all matching hosts
+/svc check mim in lionamxp host 5 # Check a specific host only
+/svc restart mim on pubwxp        # Restart service (with confirmation)
+/svc start mim on pubwxp          # Start service
+/svc stop mim on pubwxp           # Stop service
+/svc logs mim in lionamxp host 3  # Get logs from a specific host
+/svc version mim in pubwxp        # Get software version from etcd
+/svc list                         # List all supported roles
+```
+
+Discovers hosts from etcd, opens concurrent SSH connections, runs the command on all matching hosts in parallel, and returns aggregated results.
+
+**Restart confirmation:** All restarts require a Yes/Cancel confirmation showing the host count. Critical roles (`mim`, `mphpp`, `mphhos`) get an additional second step asking whether to post a notification to `#vivox-ops-notification` before restarting. Only the user who initiated the restart can click the buttons.
+
+### `/awx` — Playbook Execution
+
+```
+/awx run syslog-troubleshooter on mim-lionamxp   # Run playbook on inventory
+/awx run check-service globally                   # Run against all ~4500 hosts
+/awx list playbooks                               # List available playbooks
+/awx set repo vivox-ops-ansible                   # Switch GitHub repo preset
+/awx queue status                                 # Check job queue
+/awx job status 285                               # Check specific job
+```
+
+Supports two GitHub repo presets (internal GHE and public GitHub) with auto-switching — if a playbook isn't found in the active repo, it checks the other one automatically. Azure hosts are auto-detected by IP range and SSH credentials are injected at job launch. Global mode runs against the central inventory with progress updates every 30 seconds and a 60-minute timeout. Jobs are queued with deduplication.
+
+### `/tf` — Terraform Scaling
+
+```
+/tf add 2 mphpp to aptus2         # Scale up (shows plan, waits for confirm)
+/tf remove 1 mphpp from aptus2    # Scale down
+/tf confirm <run_id>              # Apply a pending plan
+/tf cancel <run_id>               # Cancel a pending plan
+/tf show aptus2                   # Show current resource counts
+```
+
+Modifies `.tf` files in the `vivox-ops-openstack` repo, pushes to main, polls Terraform Cloud for plan results, and waits for explicit user confirmation before applying.
+
+### `/pods` — Kubernetes Monitoring
+
+```
+/pods                             # List all pods
+/pods unhealthy                   # Show only failing pods
+/pods details <pod-name>          # Detailed info (fuzzy match supported)
+/pods logs <pod-name>             # Recent container logs
+/pods logs <pod-name> 50          # Last 50 lines
+/pods summary                     # Namespace overview with resource totals
+```
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|------------|
+| Bot framework | Slack Bolt (Socket Mode) |
+| Language | Python 3.11, asyncio |
+| Container | Docker, Google Artifact Registry |
+| Orchestration | Kubernetes |
+| Host discovery | etcd |
+| Configuration mgmt | AWX (Ansible Tower) |
+| Infrastructure as Code | Terraform Cloud |
+| Cloud | OpenStack (via TFC), Azure (via AWX) |
+| Inter-service | aiohttp (REST) |
+| SSH | asyncssh (direct), AWX ad-hoc API (Azure) |
+
+## Setup
 
 ```bash
-# Clone and install
-git clone https://github.com/anubhavarya10/etcd-awx-sync.git
-cd etcd-awx-sync
+git clone https://github.cds.internal.unity3d.com/anubhav-arya/vops-bot.git
+cd vops-bot
 pip install -r requirements.txt
 
-# Configure
 cp .env.example .env
-# Edit .env with your credentials
+# Edit .env with your credentials (etcd, AWX, Slack tokens, SSH passwords)
 
-# Run
-source .env && python3 etcd_to_awx.py --smart
+python3 main.py
 ```
 
-## Usage Examples
+### Kubernetes Deployment
 
-### Smart Prompt Mode (Interactive)
-```bash
-python3 etcd_to_awx.py --smart
-```
-Then type natural language requests:
-- `mphpp servers for pubwxp`
-- `all ts servers`
-- `mim for lolxp domain`
-- `pubwxp` (domain only)
-- `mphhos` (role only)
-
-### Direct Prompt (Non-Interactive)
-```bash
-# Combined filter: role + domain
-python3 etcd_to_awx.py --prompt "mphpp for pubwxp"
-
-# Role only (all domains)
-python3 etcd_to_awx.py --prompt "all mim servers"
-
-# Domain only (all roles)
-python3 etcd_to_awx.py --prompt "valxp inventory"
-```
-
-### CLI Flags
-```bash
-# Full sync (all hosts)
-python3 etcd_to_awx.py --full
-
-# Filter by domain
-python3 etcd_to_awx.py --domain pubwxp
-
-# Filter by role
-python3 etcd_to_awx.py --role mphpp
-
-# Combined filter
-python3 etcd_to_awx.py --role mphpp --domain pubwxp
-
-# Custom inventory name
-python3 etcd_to_awx.py --role ts --domain valxp --inventory-name "ts-valxp-prod"
-
-# List available domains
-python3 etcd_to_awx.py --list-domains
-
-# List available roles
-python3 etcd_to_awx.py --list-roles
-```
-
-### Interactive Menu Mode
-```bash
-python3 etcd_to_awx.py
-```
-Choose from:
-1. Full sync (all hosts)
-2. Domain-specific inventory
-3. Role-specific inventory
-4. Combined filter (role + domain)
-
-## Configuration
-
-### Environment Variables
+Each service has its own `k8s/` directory with `configmap.yaml`, `deployment.yaml`, and `deploy.sh`:
 
 ```bash
-# etcd Configuration
-ETCD_SERVER=10.0.25.44
-ETCD_PORT=2379
-ETCD_PREFIX=/discovery/
+# Deploy main bot
+k8s/deploy.sh
 
-# AWX Configuration
-AWX_SERVER=10.0.74.5
-
-# AWX Authentication - OAuth2 Resource Owner Password-Based
-AWX_CLIENT_ID=your_client_id
-AWX_CLIENT_SECRET=your_client_secret
-AWX_USERNAME=admin
-AWX_PASSWORD=your_password
+# Deploy a microservice
+services/service-manager/k8s/deploy.sh
+services/pod-monitor/k8s/deploy.sh
+services/tf-manager/k8s/deploy.sh
 ```
 
-### Authentication Options
+### Build & Push
 
-| Method | Required Variables |
-|--------|-------------------|
-| OAuth2 (Recommended) | `AWX_CLIENT_ID`, `AWX_CLIENT_SECRET`, `AWX_USERNAME`, `AWX_PASSWORD` |
-| Personal Access Token | `AWX_TOKEN` |
-| Basic Auth | `AWX_USERNAME`, `AWX_PASSWORD` |
-
-## Output Example
-
-```
-============================================================
-etcd to AWX Inventory Sync
-============================================================
-Using OAuth2 Resource Owner Password-Based authentication
-
-[1] Fetching hosts from etcd...
-Connected to etcd at 10.0.25.44:2379
-
-Total hosts found in etcd: 2862
-Total domains/customers: 142
-Total roles discovered: 56
-
-Parsed prompt: domain=pubwxp, role=mphpp
-Inventory name: mphpp-pubwxp
-
-[2] Applying filters...
-    Domain filter: pubwxp
-    Role filter: mphpp
-    Hosts after filtering: 72
-
-[3] Authenticating with AWX...
-Successfully obtained OAuth token
-Successfully connected to AWX
-
-[4] Getting organization...
-Using organization: Default (ID: 1)
-
-[5] Creating inventory 'mphpp-pubwxp'...
-Inventory 'mphpp-pubwxp' already exists (ID: 4)
-
-[6] Adding 72 hosts to inventory...
-  Progress: 72/72 hosts processed...
-
-[7] Creating groups and assigning hosts...
-
-============================================================
-SYNC COMPLETED!
-============================================================
-Inventory: mphpp-pubwxp (ID: 4)
-Hosts synced: 72
-Domain filter: pubwxp
-Role filter: mphpp
-
-Groups created/updated: 2
-  - customer-pubwxp: 72 hosts
-  - role-mphpp: 72 hosts
-============================================================
-```
-
-## Host Groups
-
-The script automatically creates groups based on hostname patterns:
-
-| Group Type | Example | Description |
-|------------|---------|-------------|
-| Customer | `customer-pubwxp` | Based on etcd path |
-| Role | `role-mphpp` | Extracted from hostname |
-| Location | `location-bos` | Geographic location |
-| Cluster | `cluster-os1` | Infrastructure cluster |
-| Server Type | `gen-comp`, `sriov-comp` | Compute type |
-
-## etcd Data Structure
-
-Expected path format:
-```
-/discovery/<customer>/.../<hostname>/viv_privip     -> private IP
-/discovery/<customer>/.../<hostname>/viv_pubip      -> public IP
-/discovery/<customer>/.../<hostname>/viv_ipaddresses -> all IPs
-```
-
-## Role Extraction
-
-Roles are extracted from hostnames using the pattern `<role>-<domain>-<id>`:
-- `mphpp-pubwxp-010103-1.vivox.com` → role: `mphpp`
-- `ts-valxp-010101-1.vivox.com` → role: `ts`
-- `www5-lionamxp-024901-1.vivox.com` → role: `www`
-
-Role filtering uses **exact match** only (e.g., `mim` won't match `mimmem`).
-
-## Running from AWX
-
-The recommended way to run scheduled syncs is directly from AWX:
-
-1. Create an AWX Project pointing to this repository
-2. Create a Job Template using `playbooks/sync_inventory.yml`
-3. Add credentials via custom credential type or extra variables
-4. Schedule to run twice daily (6 AM and 6 PM)
-
-See **[docs/AWX_SETUP.md](docs/AWX_SETUP.md)** for detailed setup instructions.
-
-### Quick AWX Reference
-
-| Component | Value |
-|-----------|-------|
-| Repository | `https://github.com/anubhavarya10/etcd-awx-sync.git` |
-| Playbook | `playbooks/sync_inventory.yml` |
-| Branch | `main` |
-
-## Slack Integration
-
-Interact with the inventory sync tool directly from Slack using slash commands.
-
-### Features
-
-- **Slash Commands**: `/inventory sync`, `/inventory create`, `/inventory list-domains`, `/inventory list-roles`
-- **Interactive Dialogs**: Select domains and roles from dropdown menus
-- **Smart Prompts**: Natural language support (e.g., `/inventory create mphpp for pubwxp`)
-- **Real-time Alerts**: Get notified when syncs complete
-
-### Quick Start
+All images target `linux/amd64` for the K8s cluster:
 
 ```bash
-# Install Slack dependencies
-pip install slack_bolt slack_sdk
+# Main bot
+docker buildx build --platform linux/amd64 \
+  -t us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/slack-mcp-agent:latest --push .
 
-# Configure Slack tokens in .env
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token
-SLACK_SIGNING_SECRET=your-signing-secret
-SLACK_CHANNEL_ID=C0123456789
+# Microservices
+docker buildx build --platform linux/amd64 \
+  -t us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/service-manager:latest --push services/service-manager
 
-# Run the bot
-source .env && python slack_bot.py
+docker buildx build --platform linux/amd64 \
+  -t us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/pod-monitor:latest --push services/pod-monitor
+
+docker buildx build --platform linux/amd64 \
+  -t us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/tf-manager:latest --push services/tf-manager
 ```
 
-### Slash Commands
+## Documentation
 
-| Command | Description |
-|---------|-------------|
-| `/inventory help` | Show help message |
-| `/inventory sync` | Run full sync (all hosts) |
-| `/inventory create` | Open interactive dialog |
-| `/inventory create <prompt>` | Smart create (e.g., `mphpp for pubwxp`) |
-| `/inventory list-domains` | Show available domains |
-| `/inventory list-roles` | Show available roles |
-
-### CLI Slack Alerts
-
-Send Slack notifications from the command line:
-
-```bash
-# Send alert on sync completion
-python etcd_to_awx.py --prompt "mphpp for pubwxp" --slack-alert
-```
-
-See **[docs/SLACK_SETUP.md](docs/SLACK_SETUP.md)** for detailed Slack App setup instructions.
-
-## Troubleshooting
-
-### OAuth Token Error
-If you see `unauthorized_client`:
-- Ensure AWX OAuth app uses "Resource Owner Password-Based" grant type
-- Verify all 4 credentials are provided
-
-### No Hosts Found
-- Check `ETCD_PREFIX` matches your data structure
-- Verify etcd contains `viv_privip` or `viv_pubip` keys
-
-### Role Not Matching
-- Role filtering uses exact match only
-- Use `--list-roles` to see available roles
+- [Architecture](docs/ARCHITECTURE.md) — Component details, data flow, adding new MCPs
+- [AWX Setup](docs/AWX_SETUP.md) — AWX project and job template configuration
+- [Slack Setup](docs/SLACK_SETUP.md) — Slack app creation and token configuration
+- [Playbook Standards](docs/PLAYBOOK_STANDARDS.md) — Ansible playbook conventions
 
 ## License
 
