@@ -1,246 +1,293 @@
-# etcd-awx-sync
+# etcd to AWX Inventory Sync
 
-Tools for synchronizing host information from etcd service discovery to AWX (Ansible Tower) inventory. Includes both a CLI tool and an AI-powered Slack bot.
+A Python script that synchronizes host information from etcd to AWX (Ansible Tower) inventory with smart filtering and natural language support.
 
-## Components
+## Features
 
-| Component | Description |
-|-----------|-------------|
-| `etcd_to_awx.py` | CLI tool for direct sync operations |
-| `slack-mcp-agent` | AI-powered Slack bot with natural language support |
+- **Dynamic Discovery**: Automatically discovers all domains and roles from etcd (no hardcoded lists)
+- **Smart Prompt Mode**: Create inventories using natural language (e.g., "mphpp servers for pubwxp")
+- **Flexible Filtering**: Filter by domain, role, or both with exact matching
+- **Auto Host Groups**: Creates groups based on customer, role, location, and cluster patterns
+- **Multiple Auth Methods**: Supports OAuth2, Personal Access Token, and Basic auth
+- **Idempotent**: Safe to run multiple times - updates existing hosts
 
 ## Current Statistics
 
 | Metric | Count |
 |--------|-------|
-| Total Hosts | ~2,900+ |
+| Total Hosts | ~2,800+ |
 | Domains/Customers | 142 |
 | Discovered Roles | 56 |
 
 Top roles: `mphpp` (915), `os` (335), `mim` (286), `www` (241), `mphhos` (140), `ts` (127)
 
----
-
-# Part 1: CLI Tool (etcd_to_awx.py)
-
-## Features
-
-- **Dynamic Discovery**: Automatically discovers all domains and roles from etcd
-- **Smart Prompt Mode**: Create inventories using natural language
-- **Flexible Filtering**: Filter by domain, role, or both
-- **Auto Host Groups**: Creates groups based on customer, role, location, cluster
-
 ## Quick Start
 
 ```bash
+# Clone and install
+git clone https://github.com/anubhavarya10/etcd-awx-sync.git
+cd etcd-awx-sync
 pip install -r requirements.txt
+
+# Configure
 cp .env.example .env
 # Edit .env with your credentials
 
-# Smart prompt mode
-python3 etcd_to_awx.py --smart
-
-# Direct prompt
-python3 etcd_to_awx.py --prompt "mphpp for pubwxp"
-
-# CLI flags
-python3 etcd_to_awx.py --role mphpp --domain pubwxp
+# Run
+source .env && python3 etcd_to_awx.py --smart
 ```
 
-## CLI Usage
+## Usage Examples
 
+### Smart Prompt Mode (Interactive)
+```bash
+python3 etcd_to_awx.py --smart
+```
+Then type natural language requests:
+- `mphpp servers for pubwxp`
+- `all ts servers`
+- `mim for lolxp domain`
+- `pubwxp` (domain only)
+- `mphhos` (role only)
+
+### Direct Prompt (Non-Interactive)
+```bash
+# Combined filter: role + domain
+python3 etcd_to_awx.py --prompt "mphpp for pubwxp"
+
+# Role only (all domains)
+python3 etcd_to_awx.py --prompt "all mim servers"
+
+# Domain only (all roles)
+python3 etcd_to_awx.py --prompt "valxp inventory"
+```
+
+### CLI Flags
 ```bash
 # Full sync (all hosts)
 python3 etcd_to_awx.py --full
 
-# List available domains/roles
-python3 etcd_to_awx.py --list-domains
-python3 etcd_to_awx.py --list-roles
-
-# Filter by domain and/or role
+# Filter by domain
 python3 etcd_to_awx.py --domain pubwxp
+
+# Filter by role
 python3 etcd_to_awx.py --role mphpp
+
+# Combined filter
 python3 etcd_to_awx.py --role mphpp --domain pubwxp
+
+# Custom inventory name
+python3 etcd_to_awx.py --role ts --domain valxp --inventory-name "ts-valxp-prod"
+
+# List available domains
+python3 etcd_to_awx.py --list-domains
+
+# List available roles
+python3 etcd_to_awx.py --list-roles
 ```
 
----
-
-# Part 2: Slack Bot (slack-mcp-agent)
-
-An AI-powered Slack bot that handles infrastructure operations through natural language.
-
-## Architecture
-
+### Interactive Menu Mode
+```bash
+python3 etcd_to_awx.py
 ```
-┌─────────────────┐
-│   Slack User    │
-│  "how many      │
-│ mphpp in bnxp?" │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌─────────────────┐
-│   Slack API     │────►│  Slack Agent    │
-│  (Socket Mode)  │     │   (agent.py)    │
-└─────────────────┘     └────────┬────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-              ┌──────────┐ ┌──────────┐ ┌──────────┐
-              │   LLM    │ │   MCP    │ │  Health  │
-              │  Client  │ │ Registry │ │  Server  │
-              └────┬─────┘ └────┬─────┘ └──────────┘
-                   │            │
-                   ▼            ▼
-              Parse Intent  Route to MCP
-                   │            │
-                   └─────┬──────┘
-                         ▼
-              ┌─────────────────────┐
-              │   etcd-awx-sync     │
-              │        MCP          │
-              └──────────┬──────────┘
-                         │
-              ┌──────────┴──────────┐
-              ▼                     ▼
-         ┌─────────┐          ┌─────────┐
-         │  etcd   │          │   AWX   │
-         └─────────┘          └─────────┘
-```
+Choose from:
+1. Full sync (all hosts)
+2. Domain-specific inventory
+3. Role-specific inventory
+4. Combined filter (role + domain)
 
-## Slack Commands
+## Configuration
 
-### Query Commands (no confirmation needed)
-```
-/agent list domains              # Show all domains with host counts
-/agent list roles                # Show all roles with host counts
-/agent list roles in bnxp        # Show roles in specific domain
-/agent status                    # Show overall statistics
-/agent how many mphpp does bnxp have    # Count specific role in domain
-/agent how many hosts does lolxp have   # Count total hosts in domain
-/agent how many domains have ngx        # Count domains with specific role
-```
-
-### Action Commands (requires confirmation)
-```
-/agent sync all inventory        # Full sync from etcd to AWX
-/agent create mphpp for pubwxp   # Create filtered inventory
-```
-
-## Deployment
-
-### Build and Push Docker Image
+### Environment Variables
 
 ```bash
-# Login to GAR
-gcloud auth configure-docker us-east1-docker.pkg.dev
+# etcd Configuration
+ETCD_SERVER=10.0.25.44
+ETCD_PORT=2379
+ETCD_PREFIX=/discovery/
 
-# Build for amd64 and push
-docker buildx build --platform linux/amd64 \
-  -t us-east1-docker.pkg.dev/unity-vivox-docker-registry/mcp-vivox-ops/slack-mcp-agent:latest \
-  --push .
+# AWX Configuration
+AWX_SERVER=10.0.74.5
+
+# AWX Authentication - OAuth2 Resource Owner Password-Based
+AWX_CLIENT_ID=your_client_id
+AWX_CLIENT_SECRET=your_client_secret
+AWX_USERNAME=admin
+AWX_PASSWORD=your_password
 ```
 
-### Deploy to Kubernetes
+### Authentication Options
+
+| Method | Required Variables |
+|--------|-------------------|
+| OAuth2 (Recommended) | `AWX_CLIENT_ID`, `AWX_CLIENT_SECRET`, `AWX_USERNAME`, `AWX_PASSWORD` |
+| Personal Access Token | `AWX_TOKEN` |
+| Basic Auth | `AWX_USERNAME`, `AWX_PASSWORD` |
+
+## Output Example
+
+```
+============================================================
+etcd to AWX Inventory Sync
+============================================================
+Using OAuth2 Resource Owner Password-Based authentication
+
+[1] Fetching hosts from etcd...
+Connected to etcd at 10.0.25.44:2379
+
+Total hosts found in etcd: 2862
+Total domains/customers: 142
+Total roles discovered: 56
+
+Parsed prompt: domain=pubwxp, role=mphpp
+Inventory name: mphpp-pubwxp
+
+[2] Applying filters...
+    Domain filter: pubwxp
+    Role filter: mphpp
+    Hosts after filtering: 72
+
+[3] Authenticating with AWX...
+Successfully obtained OAuth token
+Successfully connected to AWX
+
+[4] Getting organization...
+Using organization: Default (ID: 1)
+
+[5] Creating inventory 'mphpp-pubwxp'...
+Inventory 'mphpp-pubwxp' already exists (ID: 4)
+
+[6] Adding 72 hosts to inventory...
+  Progress: 72/72 hosts processed...
+
+[7] Creating groups and assigning hosts...
+
+============================================================
+SYNC COMPLETED!
+============================================================
+Inventory: mphpp-pubwxp (ID: 4)
+Hosts synced: 72
+Domain filter: pubwxp
+Role filter: mphpp
+
+Groups created/updated: 2
+  - customer-pubwxp: 72 hosts
+  - role-mphpp: 72 hosts
+============================================================
+```
+
+## Host Groups
+
+The script automatically creates groups based on hostname patterns:
+
+| Group Type | Example | Description |
+|------------|---------|-------------|
+| Customer | `customer-pubwxp` | Based on etcd path |
+| Role | `role-mphpp` | Extracted from hostname |
+| Location | `location-bos` | Geographic location |
+| Cluster | `cluster-os1` | Infrastructure cluster |
+| Server Type | `gen-comp`, `sriov-comp` | Compute type |
+
+## etcd Data Structure
+
+Expected path format:
+```
+/discovery/<customer>/.../<hostname>/viv_privip     -> private IP
+/discovery/<customer>/.../<hostname>/viv_pubip      -> public IP
+/discovery/<customer>/.../<hostname>/viv_ipaddresses -> all IPs
+```
+
+## Role Extraction
+
+Roles are extracted from hostnames using the pattern `<role>-<domain>-<id>`:
+- `mphpp-pubwxp-010103-1.vivox.com` → role: `mphpp`
+- `ts-valxp-010101-1.vivox.com` → role: `ts`
+- `www5-lionamxp-024901-1.vivox.com` → role: `www`
+
+Role filtering uses **exact match** only (e.g., `mim` won't match `mimmem`).
+
+## Running from AWX
+
+The recommended way to run scheduled syncs is directly from AWX:
+
+1. Create an AWX Project pointing to this repository
+2. Create a Job Template using `playbooks/sync_inventory.yml`
+3. Add credentials via custom credential type or extra variables
+4. Schedule to run twice daily (6 AM and 6 PM)
+
+See **[docs/AWX_SETUP.md](docs/AWX_SETUP.md)** for detailed setup instructions.
+
+### Quick AWX Reference
+
+| Component | Value |
+|-----------|-------|
+| Repository | `https://github.com/anubhavarya10/etcd-awx-sync.git` |
+| Playbook | `playbooks/sync_inventory.yml` |
+| Branch | `main` |
+
+## Slack Integration
+
+Interact with the inventory sync tool directly from Slack using slash commands.
+
+### Features
+
+- **Slash Commands**: `/inventory sync`, `/inventory create`, `/inventory list-domains`, `/inventory list-roles`
+- **Interactive Dialogs**: Select domains and roles from dropdown menus
+- **Smart Prompts**: Natural language support (e.g., `/inventory create mphpp for pubwxp`)
+- **Real-time Alerts**: Get notified when syncs complete
+
+### Quick Start
 
 ```bash
-# Create image pull secret
-kubectl create secret docker-registry gcr-secret \
-  --docker-server=us-east1-docker.pkg.dev \
-  --docker-username=_json_key \
-  --docker-password="$(cat /path/to/gcr-key.json)" \
-  --docker-email=your-email@example.com
+# Install Slack dependencies
+pip install slack_bolt slack_sdk
 
-# Create Slack secrets
-kubectl create secret generic slack-mcp-agent-secrets \
-  --from-literal=SLACK_BOT_TOKEN=xoxb-your-token \
-  --from-literal=SLACK_APP_TOKEN=xapp-your-token \
-  --from-literal=SLACK_SIGNING_SECRET=your-secret
+# Configure Slack tokens in .env
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
+SLACK_SIGNING_SECRET=your-signing-secret
+SLACK_CHANNEL_ID=C0123456789
 
-# Deploy
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/deployment.yaml
-
-# Restart after code changes
-kubectl rollout restart deployment slack-mcp-agent
+# Run the bot
+source .env && python slack_bot.py
 ```
 
----
+### Slash Commands
 
-# Configuration
+| Command | Description |
+|---------|-------------|
+| `/inventory help` | Show help message |
+| `/inventory sync` | Run full sync (all hosts) |
+| `/inventory create` | Open interactive dialog |
+| `/inventory create <prompt>` | Smart create (e.g., `mphpp for pubwxp`) |
+| `/inventory list-domains` | Show available domains |
+| `/inventory list-roles` | Show available roles |
 
-## Environment Variables
+### CLI Slack Alerts
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ETCD_SERVER` | etcd server hostname | localhost |
-| `ETCD_PORT` | etcd server port | 2379 |
-| `ETCD_PREFIX` | etcd key prefix | /discovery/ |
-| `AWX_SERVER` | AWX server hostname | localhost |
-| `AWX_CLIENT_ID` | AWX OAuth client ID | - |
-| `AWX_CLIENT_SECRET` | AWX OAuth client secret | - |
-| `AWX_USERNAME` | AWX username | - |
-| `AWX_PASSWORD` | AWX password | - |
-| `SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) | Required for bot |
-| `SLACK_APP_TOKEN` | Slack app token (xapp-...) | Required for bot |
-| `LLM_PROVIDER` | LLM provider (unity, anthropic, mock) | mock |
+Send Slack notifications from the command line:
 
-## Hostname Parsing
-
-Hostnames are parsed using the pattern: `<role>-<domain>-<numbers>-<index>.vivox.com`
-
-Examples:
-- `mphhos-aptus2-010103-1.vivox.com` → role=mphhos, domain=aptus2
-- `mim-bnxp-010101-2.vivox.com` → role=mim, domain=bnxp
-- `ngx-dcuxp-010103-1.vivox.com` → role=ngx, domain=dcuxp
-
----
-
-# Project Structure
-
-```
-etcd-awx-sync/
-├── etcd_to_awx.py           # CLI sync tool
-├── src/
-│   ├── agent.py             # Slack bot agent
-│   ├── llm_client.py        # LLM integration
-│   └── mcps/
-│       ├── base.py          # Base MCP class
-│       ├── registry.py      # MCP registry
-│       └── etcd_awx/
-│           └── mcp.py       # etcd-awx MCP
-├── k8s/
-│   ├── deployment.yaml      # K8s deployment
-│   ├── configmap.yaml       # Configuration
-│   └── deploy.sh            # Deploy script
-├── playbooks/
-│   └── sync_inventory.yml   # AWX playbook
-├── docs/
-│   └── AWX_SETUP.md         # AWX setup guide
-├── main.py                  # Bot entry point
-├── Dockerfile
-└── requirements.txt
+```bash
+# Send alert on sync completion
+python etcd_to_awx.py --prompt "mphpp for pubwxp" --slack-alert
 ```
 
----
+See **[docs/SLACK_SETUP.md](docs/SLACK_SETUP.md)** for detailed Slack App setup instructions.
 
-# Troubleshooting
+## Troubleshooting
 
-### ImagePullBackOff (K8s)
-- Check gcr-secret exists: `kubectl get secret gcr-secret`
-- Verify service account has `roles/storage.objectViewer`
-- Ensure image is built for linux/amd64
-
-### 0 domains/hosts returned
-- Check etcd connectivity
-- Verify ETCD_SERVER and ETCD_PORT
-- Check ETCD_PREFIX matches your structure
-
-### OAuth Token Error (AWX)
+### OAuth Token Error
+If you see `unauthorized_client`:
 - Ensure AWX OAuth app uses "Resource Owner Password-Based" grant type
 - Verify all 4 credentials are provided
 
----
+### No Hosts Found
+- Check `ETCD_PREFIX` matches your data structure
+- Verify etcd contains `viv_privip` or `viv_pubip` keys
+
+### Role Not Matching
+- Role filtering uses exact match only
+- Use `--list-roles` to see available roles
 
 ## License
 

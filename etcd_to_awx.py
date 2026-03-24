@@ -12,7 +12,8 @@ import os
 import sys
 import argparse
 import re
-from typing import Dict, List, Any, Optional, Tuple, Set
+import time
+from typing import Dict, List, Any, Optional, Tuple, Set, Callable
 
 # Configuration - can be overridden by environment variables
 ETCD_SERVER = os.environ.get("ETCD_SERVER", "localhost")
@@ -697,9 +698,7 @@ def smart_prompt_mode(available_domains: Set[str], available_roles: Set[str]) ->
             sys.exit(0)
 
         if input_lower == 'list domains' or input_lower == 'domains':
-            print("\nAvailable domains (sorted by host count):")
-            domain_counts = {}
-            # We don't have host counts here, just list alphabetically
+            print("\nAvailable domains (sorted alphabetically):")
             for d in sorted(available_domains)[:40]:
                 print(f"  - {d}")
             if len(available_domains) > 40:
@@ -766,7 +765,7 @@ def smart_prompt_mode(available_domains: Set[str], available_roles: Set[str]) ->
             role_filter = new_role if new_role and new_role != 'all' else role_filter
             inventory_name = new_name if new_name else inventory_name
 
-            print(f"\nFinal configuration:")
+            print("\nFinal configuration:")
             print(f"  Domain: {domain_filter or 'ALL'}")
             print(f"  Role: {role_filter or 'ALL'}")
             print(f"  Inventory: {inventory_name}")
@@ -821,8 +820,101 @@ Examples:
     parser.add_argument('--prompt', '-p', type=str, help='Direct natural language prompt (non-interactive)')
     parser.add_argument('--list-domains', action='store_true', help='List all available domains')
     parser.add_argument('--list-roles', action='store_true', help='List all available roles')
+    parser.add_argument('--slack-alert', action='store_true', help='Send Slack notification on completion')
 
     return parser.parse_args()
+
+
+def run_sync(
+    domain_filter: Optional[str] = None,
+    role_filter: Optional[str] = None,
+    inventory_name: Optional[str] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Run the sync operation programmatically.
+
+    Args:
+        domain_filter: Filter by domain/customer
+        role_filter: Filter by role
+        inventory_name: Custom inventory name
+        progress_callback: Optional callback for progress updates
+
+    Returns:
+        Dict with sync results including:
+        - inventory_name, inventory_id, host_count, group_count, duration_seconds
+        - domain_filter, role_filter
+    """
+    start_time = time.time()
+
+    def log(msg: str):
+        print(msg)
+        if progress_callback:
+            progress_callback(msg)
+
+    # Get hosts from etcd
+    log("Fetching hosts from etcd...")
+    all_hosts, all_domains, all_roles = get_hosts_from_etcd()
+
+    if not all_hosts:
+        raise ValueError("No hosts found in etcd")
+
+    # Build inventory name if not provided
+    if not inventory_name:
+        if role_filter and domain_filter:
+            inventory_name = f"{role_filter}-{domain_filter}"
+        elif role_filter:
+            inventory_name = f"{role_filter}-all-domains"
+        elif domain_filter:
+            inventory_name = f"{domain_filter}-inventory"
+        else:
+            inventory_name = "central inventory"
+
+    # Apply filters
+    if domain_filter or role_filter:
+        log(f"Applying filters: domain={domain_filter or 'all'}, role={role_filter or 'all'}")
+        hosts = filter_hosts(all_hosts, domain_filter, role_filter)
+        if not hosts:
+            raise ValueError(f"No hosts match filters: domain={domain_filter}, role={role_filter}")
+    else:
+        hosts = all_hosts
+
+    log(f"Found {len(hosts)} hosts to sync")
+
+    # Create AWX session
+    log("Authenticating with AWX...")
+    session = create_awx_session()
+
+    response = session.get(f"{get_awx_api_url()}/ping/")
+    response.raise_for_status()
+
+    # Get organization
+    org_id = get_or_create_organization(session)
+
+    # Create inventory
+    log(f"Creating inventory '{inventory_name}'...")
+    inventory_id = create_inventory(session, org_id, inventory_name)
+
+    # Add hosts
+    log(f"Adding {len(hosts)} hosts to inventory...")
+    host_id_map = add_hosts_to_inventory(session, inventory_id, hosts)
+
+    # Create groups
+    log("Creating groups and assigning hosts...")
+    group_members = create_groups_and_assign_hosts(session, inventory_id, hosts, host_id_map)
+
+    duration = time.time() - start_time
+
+    return {
+        "inventory_name": inventory_name,
+        "inventory_id": inventory_id,
+        "host_count": len(host_id_map),
+        "group_count": len(group_members),
+        "duration_seconds": duration,
+        "domain_filter": domain_filter,
+        "role_filter": role_filter,
+        "groups": group_members,
+    }
 
 
 def main():
@@ -897,9 +989,12 @@ def main():
             else:
                 inventory_name = "central inventory"
 
+    # Track start time for duration calculation
+    start_time = time.time()
+
     # Step 2: Apply filters
     if domain_filter or role_filter:
-        print(f"\n[2] Applying filters...")
+        print("\n[2] Applying filters...")
         if domain_filter:
             print(f"    Domain filter: {domain_filter}")
         if role_filter:
@@ -917,7 +1012,7 @@ def main():
         hosts = all_hosts
 
     # Step 3: Create AWX session
-    print(f"\n[3] Authenticating with AWX...")
+    print("\n[3] Authenticating with AWX...")
     session = create_awx_session()
 
     try:
@@ -944,6 +1039,9 @@ def main():
     print("\n[7] Creating groups and assigning hosts...")
     group_members = create_groups_and_assign_hosts(session, inventory_id, hosts, host_id_map)
 
+    # Calculate duration
+    duration_seconds = time.time() - start_time
+
     # Summary
     print("\n" + "=" * 60)
     print("SYNC COMPLETED!")
@@ -959,7 +1057,32 @@ def main():
         print(f"  - {group_name}: {len(members)} hosts")
     if len(group_members) > 15:
         print(f"  ... and {len(group_members) - 15} more groups")
+    print(f"\nDuration: {duration_seconds:.1f} seconds")
     print("=" * 60)
+
+    # Send Slack alert if requested
+    if args.slack_alert:
+        print("\n[8] Sending Slack notification...")
+        try:
+            from slack_alerts import send_sync_complete_alert
+            success = send_sync_complete_alert(
+                inventory_name=inventory_name,
+                host_count=len(host_id_map),
+                group_count=len(group_members),
+                duration_seconds=duration_seconds,
+                domain_filter=domain_filter,
+                role_filter=role_filter,
+                inventory_id=inventory_id,
+                awx_server=AWX_SERVER,
+            )
+            if success:
+                print("Slack notification sent successfully")
+            else:
+                print("Failed to send Slack notification")
+        except ImportError:
+            print("Warning: slack_alerts module not available. Install slack_sdk to enable Slack alerts.")
+        except Exception as e:
+            print(f"Error sending Slack notification: {e}")
 
 
 def run_sync(

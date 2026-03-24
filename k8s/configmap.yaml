@@ -13,14 +13,26 @@ data:
   ETCD_PORT: "2379"
   ETCD_PREFIX: "/discovery/"
 
-  # AWX Configuration
-  AWX_SERVER: "10.0.74.5"
+  # AWX Configuration (fallback IP: 10.0.74.4)
+  AWX_SERVER: "awx.vivox.com"
+  AWX_EXECUTION_ENVIRONMENT_ID: "4"  # EE4 with all requirements
+  AWX_CREDENTIAL_ID: "5"  # vivox-ssh-key (Machine credential for SSH)
 
   # GitHub Configuration for Playbooks
   GITHUB_API_URL: "https://github.cds.internal.unity3d.com/api/v3"
   GITHUB_PLAYBOOKS_REPO: "unity/vivox-ops-docker"
   GITHUB_PLAYBOOKS_PATH: "ansible"
   GITHUB_PLAYBOOKS_BRANCH: "main"
+
+  # Remote MCPs (format: REMOTE_MCP_<NAME>=<URL>)
+  REMOTE_MCP_SERVICE_MANAGER: "http://service-manager:8081"
+  REMOTE_MCP_SERVICE_MANAGER_TIMEOUT: "120"
+  REMOTE_MCP_POD_MONITOR: "http://pod-monitor:8082"
+  REMOTE_MCP_TF_MANAGER: "http://tf-manager:8083"
+  REMOTE_MCP_TF_MANAGER_TIMEOUT: "600"
+
+  # Slack notification channel for service restarts
+  OPS_NOTIFICATION_CHANNEL_ID: "C01LM1U6YG7"
 
   # Application Configuration
   LOG_LEVEL: "INFO"
