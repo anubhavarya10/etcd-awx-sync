@@ -5,8 +5,12 @@ import asyncio
 import time
 import logging
 import requests
+import urllib3
 from typing import Any, Dict, List, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
+
+# Disable SSL warnings for self-signed certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from ..base import BaseMCP, MCPAction, MCPResult, MCPResultStatus
 from ...request_queue import (
@@ -31,13 +35,33 @@ class AwxPlaybookMCP(BaseMCP):
     - Manage request queue
     """
 
+    # Pre-configured repo presets (name -> config)
+    REPO_PRESETS = {
+        "vivox-ops-docker": {
+            "api_url": "https://github.cds.internal.unity3d.com/api/v3",
+            "repo": "unity/vivox-ops-docker",
+            "path": "ansible",
+            "branch": "main",
+            "token_env": "GITHUB_TOKEN",
+            "scm_credential_name": "slack-bot-github-token",
+        },
+        "vivox-ops-ansible": {
+            "api_url": "https://api.github.com",
+            "repo": "Unity-Technologies/vivox-ops-ansible",
+            "path": "general_playbooks",
+            "branch": "main",
+            "token_env": "TF_GITHUB_TOKEN",
+            "scm_credential_name": "slack-bot-github-com-token",
+        },
+    }
+
     def __init__(self, notify_callback: Optional[Callable] = None):
         # AWX configuration
         self.awx_server = os.environ.get("AWX_SERVER", "localhost")
         self.awx_username = os.environ.get("AWX_USERNAME")
         self.awx_password = os.environ.get("AWX_PASSWORD")
 
-        # GitHub configuration
+        # GitHub configuration (defaults to vivox-ops-docker)
         self.github_api_url = os.environ.get(
             "GITHUB_API_URL",
             "https://github.cds.internal.unity3d.com/api/v3"
@@ -46,9 +70,17 @@ class AwxPlaybookMCP(BaseMCP):
         self.github_repo = os.environ.get("GITHUB_PLAYBOOKS_REPO", "unity/vivox-ops-docker")
         self.github_path = os.environ.get("GITHUB_PLAYBOOKS_PATH", "ansible")
         self.github_branch = os.environ.get("GITHUB_PLAYBOOKS_BRANCH", "main")
+        self._active_preset: Optional[str] = "vivox-ops-docker"
+        self._scm_credential_name = "slack-bot-github-token"
 
         # AWX credential ID for SSH access to hosts
         self.awx_credential_id = os.environ.get("AWX_CREDENTIAL_ID")
+
+        # AWX Execution Environment ID (e.g., EE4 with all requirements)
+        self.awx_execution_environment_id = os.environ.get("AWX_EXECUTION_ENVIRONMENT_ID")
+
+        # Azure SSH configuration (for hosts with IPs starting with 10.253.x.x)
+        self.azure_sudo_password = os.environ.get("AZURE_SUDO_PASSWORD")
 
         # Cache for playbooks
         self._playbook_cache: Dict[str, Any] = {
@@ -59,6 +91,11 @@ class AwxPlaybookMCP(BaseMCP):
 
         # Track AWX project ID (created once)
         self._awx_project_id: Optional[int] = None
+
+        # Global runbook configuration
+        self.global_inventory_name = os.environ.get("AWX_GLOBAL_INVENTORY", "central inventory")
+        self.global_job_timeout = int(os.environ.get("AWX_GLOBAL_JOB_TIMEOUT", "3600"))  # 60 min
+        self.global_progress_interval = int(os.environ.get("AWX_GLOBAL_PROGRESS_INTERVAL", "30"))  # 30s
 
         # Request queue for multi-user handling
         self._notify_callback = notify_callback
@@ -74,11 +111,13 @@ class AwxPlaybookMCP(BaseMCP):
         self._queue.notify_callback = notify_callback
 
         # Set up executor that calls our internal method
-        async def queue_executor(playbook, inventory, extra_vars, user_id, channel_id):
+        async def queue_executor(playbook, inventory, extra_vars, user_id, channel_id, message_ts=None):
             return await self._execute_playbook_internal(
                 playbook=playbook,
                 inventory=inventory,
                 extra_vars=extra_vars,
+                channel_id=channel_id,
+                message_ts=message_ts,
             )
 
         await self._queue.start(queue_executor)
@@ -331,6 +370,8 @@ class AwxPlaybookMCP(BaseMCP):
         if action == "list-playbooks":
             return await self._handle_list_playbooks()
         elif action == "run-playbook":
+            if parameters.get("global_mode"):
+                return await self._handle_run_playbook_global(parameters, user_id, channel_id)
             return await self._handle_run_playbook(parameters, user_id, channel_id)
         elif action == "job-status":
             return await self._handle_job_status(parameters)
@@ -532,15 +573,45 @@ class AwxPlaybookMCP(BaseMCP):
                 playbook_path = f"{playbook_path}.yml"
             playbook_display = playbook_path
         else:
-            # Not found
+            # Not found in current repo — try other presets automatically
+            for other_name, other_cfg in self.REPO_PRESETS.items():
+                if other_name == self._active_preset:
+                    continue
+                # Temporarily fetch playbooks from the other repo
+                other_token = os.environ.get(other_cfg["token_env"], "")
+                if not other_token:
+                    continue
+                try:
+                    headers = {"Accept": "application/vnd.github.v3+json"}
+                    headers["Authorization"] = f"token {other_token}"
+                    url = f"{other_cfg['api_url']}/repos/{other_cfg['repo']}/contents/{other_cfg['path']}"
+                    loop = asyncio.get_event_loop()
+                    resp = await loop.run_in_executor(
+                        _executor,
+                        lambda: requests.get(url, headers=headers, params={"ref": other_cfg["branch"]}, timeout=30).json()
+                    )
+                    if isinstance(resp, list):
+                        other_names = [item.get("name", "").lower() for item in resp]
+                        playbook_lower = playbook.lower()
+                        if playbook_lower in other_names or playbook_lower + ".yml" in other_names or playbook_lower + ".yaml" in other_names:
+                            # Found it in another preset — switch and retry
+                            logger.info(f"Playbook '{playbook}' found in preset '{other_name}', auto-switching")
+                            switch_result = await self._switch_to_preset(other_name)
+                            if switch_result.status == MCPResultStatus.SUCCESS:
+                                # Retry the run with the switched repo
+                                return await self._handle_run_playbook(parameters, user_id, channel_id)
+                except Exception as e:
+                    logger.warning(f"Error checking preset {other_name} for playbook: {e}")
+
+            # Still not found in any repo
             suggestions = [p.get("name", "") for p in playbooks[:5]]
             return MCPResult(
                 status=MCPResultStatus.ERROR,
                 message=(
                     f"⚠️ *Unknown playbook:* `{playbook}`\n\n"
-                    f"*Available:* {', '.join(f'`{s}`' for s in suggestions)}\n\n"
+                    f"*Available in current repo ({self._active_preset or self.github_repo}):* {', '.join(f'`{s}`' for s in suggestions)}\n\n"
                     "Use `list playbooks` to see all.\n"
-                    "Use `show playbook <name>` to see folder contents.\n\n"
+                    "Use `set repo <preset>` to switch repos.\n\n"
                     "_Ready for next task_"
                 )
             )
@@ -572,6 +643,9 @@ class AwxPlaybookMCP(BaseMCP):
                 except json.JSONDecodeError:
                     pass
 
+            # Get message_ts from parameters for threading
+            message_ts = parameters.get("_message_ts")
+
             request = PlaybookRequest.create(
                 user_id=user_id,
                 user_name=user_id,  # Will be user ID, Slack can resolve to name later
@@ -580,14 +654,26 @@ class AwxPlaybookMCP(BaseMCP):
                 inventory=inventory,
                 extra_vars=extra_vars_dict,
                 priority=RequestPriority.NORMAL,
+                message_ts=message_ts,
             )
 
             success, message = await self._queue.submit(request)
 
+            # Return threaded response for queue submission
+            thread_msg = (
+                f"🚀 *Request Submitted*\n\n"
+                f"• Request ID: `{request.id}`\n"
+                f"• Playbook: `{playbook_path}`\n"
+                f"• Inventory: `{inventory}`\n"
+                f"• Priority: `{RequestPriority.NORMAL.name}`\n\n"
+                f"⏳ {'Starting immediately...' if success else 'Queued...'}"
+            )
+
             return MCPResult(
                 status=MCPResultStatus.SUCCESS if success else MCPResultStatus.ERROR,
-                message=message,
-                data={"request_id": request.id if success else None}
+                message="⏳ Request submitted..." if success else message,
+                data={"request_id": request.id if success else None},
+                thread_messages=[thread_msg] if success else [message],
             )
 
         # Run immediately without queue (direct execution)
@@ -634,13 +720,18 @@ class AwxPlaybookMCP(BaseMCP):
     ) -> MCPResult:
         """Execute a playbook and wait for completion with output."""
         try:
-            # Step 1: Ensure AWX project exists
+            # Step 1: Ensure AWX project exists and is synced
             project_id = await self._ensure_awx_project()
             if not project_id:
                 return MCPResult(
                     status=MCPResultStatus.ERROR,
-                    message="❌ *Failed to create AWX project*\n\n_Ready for next task_"
+                    message="❌ Failed to create AWX project",
+                    thread_messages=["❌ *Error:* Failed to create AWX project. Check AWX credentials."],
                 )
+
+            # Sync the project and wait for completion so playbooks are available
+            await self._sync_awx_project(project_id)
+            await self._wait_for_project_sync(project_id)
 
             # Step 2: Create or get job template
             template_id = await self._ensure_job_template(
@@ -651,65 +742,100 @@ class AwxPlaybookMCP(BaseMCP):
             if not template_id:
                 return MCPResult(
                     status=MCPResultStatus.ERROR,
-                    message="❌ *Failed to create job template*\n\n_Ready for next task_"
+                    message="❌ Failed to create job template",
+                    thread_messages=["❌ *Error:* Failed to create job template. Check playbook path."],
                 )
 
-            # Step 3: Launch the job
+            # Step 3: Check if inventory has Azure hosts (10.253.x.x)
+            # Azure hosts require vivoxops user with sudo instead of root
+            is_azure = self._is_azure_inventory(inventory_id)
+            if is_azure and self.azure_sudo_password:
+                logger.info(f"Azure inventory detected, using vivoxops user with sudo")
+                azure_vars = self._get_azure_extra_vars()
+                # Merge with existing extra_vars if any
+                if extra_vars:
+                    try:
+                        import json
+                        existing_vars = json.loads(extra_vars) if isinstance(extra_vars, str) else extra_vars
+                        existing_vars.update(azure_vars)
+                        extra_vars = json.dumps(existing_vars)
+                    except (json.JSONDecodeError, TypeError):
+                        extra_vars = json.dumps(azure_vars)
+                else:
+                    import json
+                    extra_vars = json.dumps(azure_vars)
+
+            # Step 4: Launch the job
             job = await self._launch_job(template_id, extra_vars)
             if not job:
                 return MCPResult(
                     status=MCPResultStatus.ERROR,
-                    message="❌ *Failed to launch job*\n\n_Ready for next task_"
+                    message="❌ Failed to launch job",
+                    thread_messages=["❌ *Error:* Failed to launch AWX job. Check AWX configuration."],
                 )
 
             job_id = job.get("id")
-            job_url = f"http://{self.awx_server}/#/jobs/playbook/{job_id}"
+            job_url = f"https://{self.awx_server}/#/jobs/playbook/{job_id}"
 
             # Step 4: Wait for job completion and get output
-            final_status, output = await self._wait_for_job_completion(job_id)
+            final_status, raw_output = await self._wait_for_job_completion(job_id)
 
             status_emoji = self._get_status_emoji(final_status)
+            result_text = "passed" if final_status == "successful" else "failed"
 
             # Parse and clean up output for readability
-            output = self._format_ansible_output(output)
+            formatted_output = self._format_ansible_output(raw_output)
 
             # Truncate output for Slack (max ~3000 chars)
-            if len(output) > 2500:
-                output = output[:2500] + "\n... (truncated, see AWX for full output)"
+            if len(formatted_output) > 2500:
+                formatted_output = formatted_output[:2500] + "\n... (truncated, see AWX for full output)"
 
             # Create descriptive title
             playbook_short = playbook_display.replace('.yml', '').replace('.yaml', '').replace('/', '-')
 
-            # Add error hints if failed
-            error_hint = ""
+            # Build thread messages with detailed info
+            thread_messages = []
+
+            # Add job details
+            thread_messages.append(
+                f"📋 *Job Details*\n"
+                f"• Playbook: `{playbook_display}`\n"
+                f"• Inventory: `{inventory_name}`\n"
+                f"• Job ID: `{job_id}`\n"
+                f"• Hosts: {host_count}"
+            )
+
+            # Add diagnosis if failed
             if final_status == "failed":
-                if "Permission denied" in output or "UNREACHABLE" in output:
-                    error_hint = (
-                        "\n\n💡 *Hint:* SSH authentication failed. "
-                        "Check that AWX has the correct SSH credential configured. "
-                        "Admin needs to set `AWX_CREDENTIAL_ID` in secrets."
-                    )
-                elif "No such file" in output:
-                    error_hint = "\n\n💡 *Hint:* Playbook file not found. Check the path."
+                diagnosis, solution = self._diagnose_failure(formatted_output, raw_output)
+                thread_messages.append(
+                    f"🔴 *Diagnosis:* {diagnosis}\n\n"
+                    f"💡 *Solution:*\n{solution}"
+                )
+
+            # Add output
+            thread_messages.append(
+                f"📄 *Output:*\n```\n{formatted_output}\n```"
+            )
+
+            # Main message update (simple result line)
+            main_update = f"*Result:* {status_emoji} {result_text} | Job: `{job_id}`"
 
             return MCPResult(
                 status=MCPResultStatus.SUCCESS if final_status == "successful" else MCPResultStatus.ERROR,
-                message=(
-                    f"{status_emoji} *{playbook_short}* on `{inventory_name}`\n\n"
-                    f"*Status:* `{final_status}` | *Job:* `{job_id}` | *Hosts:* {host_count}\n"
-                    f"{error_hint}\n"
-                    f"*Output:*\n```\n{output}\n```\n\n"
-                    f"<{job_url}|View in AWX>\n\n"
-                    f"_Ready for next task_"
-                ),
-                data={"job_id": job_id, "status": final_status, "output": output}
+                message=main_update,
+                data={"job_id": job_id, "status": final_status, "output": formatted_output},
+                thread_messages=thread_messages,
+                main_message_update=main_update,
+                awx_url=job_url,
             )
 
         except Exception as e:
             logger.exception("Error executing playbook")
             return MCPResult(
                 status=MCPResultStatus.ERROR,
-                message=f"❌ *Error executing playbook:* {str(e)}\n\n_Ready for next task_"
+                message=f"❌ Error: {str(e)}",
+                thread_messages=[f"❌ *Error executing playbook:*\n```\n{str(e)}\n```"],
             )
 
     async def _wait_for_job_completion(self, job_id: int, timeout: int = 300) -> tuple:
@@ -727,7 +853,15 @@ class AwxPlaybookMCP(BaseMCP):
             # Check if job is done
             if status in ["successful", "failed", "error", "canceled"]:
                 output = await self._get_job_output(job_id, lines=100)
-                return (status, output or "No output available")
+                # If no output (e.g., job never started due to project sync failure),
+                # include the job_explanation which contains the actual error
+                if not output or output.strip() == "":
+                    job_explanation = job.get("job_explanation", "")
+                    if job_explanation:
+                        output = f"Job did not run: {job_explanation}"
+                    else:
+                        output = "No output available"
+                return (status, output)
 
             # Wait before checking again
             await asyncio.sleep(3)
@@ -782,7 +916,7 @@ class AwxPlaybookMCP(BaseMCP):
                 # Parse and calculate (simplified)
                 duration = f"\n*Duration:* {job.get('elapsed', 'N/A')}s"
 
-            job_url = f"http://{self.awx_server}/#/jobs/playbook/{job_id}"
+            job_url = f"https://{self.awx_server}/#/jobs/playbook/{job_id}"
 
             return MCPResult(
                 status=MCPResultStatus.SUCCESS,
@@ -828,7 +962,7 @@ class AwxPlaybookMCP(BaseMCP):
             if len(output) > 3000:
                 output = output[:3000] + "\n... (truncated)"
 
-            job_url = f"http://{self.awx_server}/#/jobs/playbook/{job_id}"
+            job_url = f"https://{self.awx_server}/#/jobs/playbook/{job_id}"
 
             return MCPResult(
                 status=MCPResultStatus.SUCCESS,
@@ -885,30 +1019,47 @@ class AwxPlaybookMCP(BaseMCP):
             )
 
     async def _handle_set_repo(self, parameters: Dict[str, Any]) -> MCPResult:
-        """Set the GitHub repository for playbooks."""
+        """Set the GitHub repository for playbooks. Supports preset names or custom repos."""
         repo = parameters.get("repo", "").strip()
         path = parameters.get("path", "").strip()
         branch = parameters.get("branch", "").strip()
 
         if not repo:
+            # Show available presets
+            preset_lines = []
+            for name, cfg in self.REPO_PRESETS.items():
+                active = " *(active)*" if name == self._active_preset else ""
+                preset_lines.append(f"  `{name}` - `{cfg['repo']}` (path: `{cfg['path']}`){active}")
+
             return MCPResult(
                 status=MCPResultStatus.ERROR,
                 message=(
-                    "⚠️ *Repository required*\n\n"
-                    "Usage: `set repo <org/repo-name> [path <folder>] [branch <branch>]`\n\n"
-                    "Example: `set repo unity/ansible-playbooks path playbooks branch main`\n\n"
+                    ":warning: *Repository required*\n\n"
+                    "*Available presets:*\n" + "\n".join(preset_lines) + "\n\n"
+                    "Usage:\n"
+                    "  `set repo vivox-ops-ansible` — switch to a preset\n"
+                    "  `set repo <org/repo-name> [path <folder>] [branch <branch>]` — custom repo\n\n"
                     "_Ready for next task_"
                 )
             )
+
+        # Check if it's a preset name
+        if repo in self.REPO_PRESETS:
+            return await self._switch_to_preset(repo)
+
+        # Also match partial preset names
+        for preset_name in self.REPO_PRESETS:
+            if repo.lower() in preset_name.lower():
+                return await self._switch_to_preset(preset_name)
 
         # Validate repo format (should be org/repo)
         if "/" not in repo:
             return MCPResult(
                 status=MCPResultStatus.ERROR,
                 message=(
-                    f"⚠️ *Invalid repository format:* `{repo}`\n\n"
-                    "Expected format: `org/repo-name`\n"
-                    "Example: `unity/vivox-ops-docker`\n\n"
+                    f":warning: *Invalid repository format:* `{repo}`\n\n"
+                    "Expected format: `org/repo-name` or a preset name\n"
+                    "Example: `unity/vivox-ops-docker` or `vivox-ops-ansible`\n\n"
                     "_Ready for next task_"
                 )
             )
@@ -916,9 +1067,11 @@ class AwxPlaybookMCP(BaseMCP):
         old_repo = self.github_repo
         old_path = self.github_path
         old_branch = self.github_branch
+        old_preset = self._active_preset
 
         # Update configuration
         self.github_repo = repo
+        self._active_preset = None
         if path:
             self.github_path = path
         if branch:
@@ -938,12 +1091,13 @@ class AwxPlaybookMCP(BaseMCP):
                 self.github_repo = old_repo
                 self.github_path = old_path
                 self.github_branch = old_branch
+                self._active_preset = old_preset
                 self._playbook_cache = {"playbooks": [], "last_refresh": 0}
 
                 return MCPResult(
                     status=MCPResultStatus.ERROR,
                     message=(
-                        f"⚠️ *No playbooks found in new repo*\n\n"
+                        f":warning: *No playbooks found in new repo*\n\n"
                         f"Repository: `{repo}`\n"
                         f"Path: `{path or self.github_path}`\n"
                         f"Branch: `{branch or self.github_branch}`\n\n"
@@ -955,7 +1109,7 @@ class AwxPlaybookMCP(BaseMCP):
             return MCPResult(
                 status=MCPResultStatus.SUCCESS,
                 message=(
-                    f"✅ *Repository Updated*\n\n"
+                    f":white_check_mark: *Repository Updated*\n\n"
                     f"*Repository:* `{self.github_repo}`\n"
                     f"*Path:* `{self.github_path}`\n"
                     f"*Branch:* `{self.github_branch}`\n\n"
@@ -970,13 +1124,118 @@ class AwxPlaybookMCP(BaseMCP):
             self.github_repo = old_repo
             self.github_path = old_path
             self.github_branch = old_branch
+            self._active_preset = old_preset
             self._playbook_cache = {"playbooks": [], "last_refresh": 0}
 
             logger.exception("Error setting repo")
             return MCPResult(
                 status=MCPResultStatus.ERROR,
                 message=(
-                    f"❌ *Error accessing repository:* {str(e)}\n\n"
+                    f":x: *Error accessing repository:* {str(e)}\n\n"
+                    "Configuration not changed.\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+    async def _switch_to_preset(self, preset_name: str) -> MCPResult:
+        """Switch to a pre-configured repo preset."""
+        preset = self.REPO_PRESETS[preset_name]
+
+        old_api_url = self.github_api_url
+        old_token = self.github_token
+        old_repo = self.github_repo
+        old_path = self.github_path
+        old_branch = self.github_branch
+        old_preset = self._active_preset
+        old_scm_name = self._scm_credential_name
+
+        # Apply preset
+        self.github_api_url = preset["api_url"]
+        self.github_token = os.environ.get(preset["token_env"], "")
+        self.github_repo = preset["repo"]
+        self.github_path = preset["path"]
+        self.github_branch = preset["branch"]
+        self._active_preset = preset_name
+        self._scm_credential_name = preset["scm_credential_name"]
+
+        # Clear cache and reset project
+        self._playbook_cache = {"playbooks": [], "last_refresh": 0}
+        self._awx_project_id = None
+
+        # Validate by fetching playbooks
+        try:
+            playbooks = await self._fetch_playbooks_from_github()
+
+            if not playbooks:
+                # Revert
+                self.github_api_url = old_api_url
+                self.github_token = old_token
+                self.github_repo = old_repo
+                self.github_path = old_path
+                self.github_branch = old_branch
+                self._active_preset = old_preset
+                self._scm_credential_name = old_scm_name
+                self._playbook_cache = {"playbooks": [], "last_refresh": 0}
+
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=(
+                        f":warning: *No playbooks found in `{preset_name}`*\n\n"
+                        f"Repository: `{preset['repo']}`\n"
+                        f"Path: `{preset['path']}`\n\n"
+                        "Configuration not changed.\n\n"
+                        "_Ready for next task_"
+                    )
+                )
+
+            # Build playbook listing
+            playbook_lines = []
+            folders = [p for p in playbooks if p.get("type") == "folder"]
+            files = [p for p in playbooks if p.get("type") == "file"]
+
+            if folders:
+                playbook_lines.append("*Playbook Folders:*")
+                for p in sorted(folders, key=lambda x: x["name"]):
+                    playbook_lines.append(f"  :file_folder: `{p['name']}/`")
+
+            if files:
+                playbook_lines.append("*Playbook Files:*")
+                for p in sorted(files, key=lambda x: x["name"]):
+                    playbook_lines.append(f"  :page_facing_up: `{p['name']}`")
+
+            playbook_list = "\n".join(playbook_lines) if playbook_lines else ""
+
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS,
+                message=(
+                    f":white_check_mark: *Switched to `{preset_name}`*\n\n"
+                    f"*Repository:* `{self.github_repo}`\n"
+                    f"*Path:* `{self.github_path}`\n"
+                    f"*Branch:* `{self.github_branch}`\n\n"
+                    f"*Playbooks available:* {len(playbooks)}\n\n"
+                    f"{playbook_list}\n\n"
+                    "To run: `/awx run <playbook> on <inventory>`\n\n"
+                    "_Ready for next task_"
+                ),
+                data={"preset": preset_name, "repo": self.github_repo, "path": self.github_path}
+            )
+
+        except Exception as e:
+            # Revert
+            self.github_api_url = old_api_url
+            self.github_token = old_token
+            self.github_repo = old_repo
+            self.github_path = old_path
+            self.github_branch = old_branch
+            self._active_preset = old_preset
+            self._scm_credential_name = old_scm_name
+            self._playbook_cache = {"playbooks": [], "last_refresh": 0}
+
+            logger.exception(f"Error switching to preset {preset_name}")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    f":x: *Error accessing `{preset_name}`:* {str(e)}\n\n"
                     "Configuration not changed.\n\n"
                     "_Ready for next task_"
                 )
@@ -993,16 +1252,26 @@ class AwxPlaybookMCP(BaseMCP):
             except Exception:
                 playbook_count = 0
 
+        # Build preset list
+        preset_lines = []
+        for name, cfg in self.REPO_PRESETS.items():
+            if name == self._active_preset:
+                preset_lines.append(f"  :white_check_mark: `{name}` - `{cfg['repo']}` (path: `{cfg['path']}`) *(active)*")
+            else:
+                preset_lines.append(f"  :white_circle: `{name}` - `{cfg['repo']}` (path: `{cfg['path']}`)")
+
         return MCPResult(
             status=MCPResultStatus.SUCCESS,
             message=(
-                f"📁 *Playbook Repository Configuration*\n\n"
+                f":file_folder: *Playbook Repository Configuration*\n\n"
                 f"*Repository:* `{self.github_repo}`\n"
                 f"*Path:* `{self.github_path}`\n"
                 f"*Branch:* `{self.github_branch}`\n"
                 f"*API URL:* `{self.github_api_url}`\n\n"
                 f"*Playbooks available:* {playbook_count}\n\n"
-                f"To change: `set repo <org/repo> [path <folder>] [branch <branch>]`\n\n"
+                f"*Available presets:*\n" + "\n".join(preset_lines) + "\n\n"
+                f"To switch: `set repo <preset-name>` (e.g. `set repo vivox-ops-ansible`)\n"
+                f"Custom: `set repo <org/repo> [path <folder>] [branch <branch>]`\n\n"
                 f"_Ready for next task_"
             ),
             data={
@@ -1011,6 +1280,7 @@ class AwxPlaybookMCP(BaseMCP):
                 "branch": self.github_branch,
                 "api_url": self.github_api_url,
                 "playbook_count": playbook_count,
+                "active_preset": self._active_preset,
             }
         )
 
@@ -1210,8 +1480,13 @@ class AwxPlaybookMCP(BaseMCP):
         playbook: str,
         inventory: str,
         extra_vars: Optional[Dict[str, Any]] = None,
+        channel_id: Optional[str] = None,
+        message_ts: Optional[str] = None,
     ) -> MCPResult:
         """Execute playbook internally (used by queue executor)."""
+        # Check for global mode flag in extra_vars
+        is_global = extra_vars and extra_vars.pop("_global_mode", False)
+
         # Get inventory info
         inventory_info = await self._get_inventory(inventory)
         if not inventory_info:
@@ -1222,6 +1497,17 @@ class AwxPlaybookMCP(BaseMCP):
 
         inv_id = inventory_info.get("id")
         host_count = inventory_info.get("total_hosts", 0)
+
+        if is_global:
+            return await self._execute_playbook_global(
+                playbook=playbook,
+                inventory_id=inv_id,
+                inventory_name=inventory,
+                host_count=host_count,
+                extra_vars=extra_vars,
+                channel_id=channel_id,
+                message_ts=message_ts,
+            )
 
         # Convert extra_vars dict to JSON string if needed
         extra_vars_str = None
@@ -1237,6 +1523,449 @@ class AwxPlaybookMCP(BaseMCP):
             host_count=host_count,
             extra_vars=extra_vars_str,
         )
+
+    async def _handle_run_playbook_global(
+        self,
+        parameters: Dict[str, Any],
+        user_id: str,
+        channel_id: str,
+    ) -> MCPResult:
+        """Handle running a playbook globally across all hosts (central inventory)."""
+        playbook = parameters.get("playbook", "")
+        extra_vars = parameters.get("extra_vars")
+
+        # Resolve playbook path (reuse existing logic from _handle_run_playbook)
+        playbook_path = playbook
+        playbooks = await self._fetch_playbooks_from_github()
+
+        folder_match = None
+        file_match = None
+        for pb in playbooks:
+            name = pb.get("name", "")
+            pb_type = pb.get("type", "file")
+            if pb_type == "folder":
+                if playbook.lower().rstrip("/") == name.lower():
+                    folder_match = name
+                    break
+            else:
+                name_lower = name.lower()
+                playbook_lower = playbook.lower()
+                if playbook_lower == name_lower or playbook_lower + ".yml" == name_lower:
+                    file_match = name
+                    break
+
+        if folder_match:
+            files = await self._fetch_playbook_files(folder_match)
+            yml_files = [f for f in files if f.get("name", "").endswith((".yml", ".yaml"))]
+            if not yml_files:
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message=f"⚠️ *No playbooks found in folder:* `{folder_match}/`\n\n_Ready for next task_"
+                )
+            if len(yml_files) == 1:
+                playbook_path = f"{folder_match}/{yml_files[0]['name']}"
+            else:
+                main_playbook = None
+                yml_names = [f.get("name", "") for f in yml_files]
+                for name in yml_names:
+                    if name.replace(".yml", "").replace(".yaml", "") == folder_match:
+                        main_playbook = name
+                        break
+                if not main_playbook:
+                    for common_name in ["main.yml", "site.yml", "playbook.yml", "setup.yml"]:
+                        if common_name in yml_names:
+                            main_playbook = common_name
+                            break
+                if main_playbook:
+                    playbook_path = f"{folder_match}/{main_playbook}"
+                else:
+                    file_list = "\n".join([f"  • `{folder_match}/{f['name']}`" for f in yml_files])
+                    return MCPResult(
+                        status=MCPResultStatus.ERROR,
+                        message=(
+                            f"📂 *Multiple playbooks in folder:* `{folder_match}/`\n\n"
+                            f"{file_list}\n\n"
+                            f"Please specify which one:\n"
+                            f"`run <folder>/<filename>.yml globally`\n\n"
+                            "_Ready for next task_"
+                        )
+                    )
+        elif file_match:
+            playbook_path = file_match
+        elif "/" in playbook:
+            playbook_path = playbook
+            if not playbook_path.endswith((".yml", ".yaml")):
+                playbook_path = f"{playbook_path}.yml"
+        else:
+            # Try other presets (same as _handle_run_playbook)
+            for other_name, other_cfg in self.REPO_PRESETS.items():
+                if other_name == self._active_preset:
+                    continue
+                other_token = os.environ.get(other_cfg["token_env"], "")
+                if not other_token:
+                    continue
+                try:
+                    headers = {"Accept": "application/vnd.github.v3+json"}
+                    headers["Authorization"] = f"token {other_token}"
+                    url = f"{other_cfg['api_url']}/repos/{other_cfg['repo']}/contents/{other_cfg['path']}"
+                    loop = asyncio.get_event_loop()
+                    resp = await loop.run_in_executor(
+                        _executor,
+                        lambda: requests.get(url, headers=headers, params={"ref": other_cfg["branch"]}, timeout=30).json()
+                    )
+                    if isinstance(resp, list):
+                        other_names = [item.get("name", "").lower() for item in resp]
+                        playbook_lower = playbook.lower()
+                        if playbook_lower in other_names or playbook_lower + ".yml" in other_names:
+                            switch_result = await self._switch_to_preset(other_name)
+                            if switch_result.status == MCPResultStatus.SUCCESS:
+                                return await self._handle_run_playbook_global(parameters, user_id, channel_id)
+                except Exception as e:
+                    logger.warning(f"Error checking preset {other_name}: {e}")
+
+            suggestions = [p.get("name", "") for p in playbooks[:5]]
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    f"⚠️ *Unknown playbook:* `{playbook}`\n\n"
+                    f"*Available:* {', '.join(f'`{s}`' for s in suggestions)}\n\n"
+                    "Use `list playbooks` to see all.\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        # Look up central inventory
+        inventory_name = self.global_inventory_name
+        inventory_info = await self._get_inventory(inventory_name)
+        if not inventory_info:
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=(
+                    f"⚠️ *Global inventory not found:* `{inventory_name}`\n\n"
+                    "The central inventory must exist in AWX.\n"
+                    "Set `AWX_GLOBAL_INVENTORY` env var if using a different name.\n\n"
+                    "_Ready for next task_"
+                )
+            )
+
+        # Submit to queue with _global_mode flag
+        if self._queue_enabled and self._queue:
+            extra_vars_dict = {}
+            if extra_vars:
+                try:
+                    import json
+                    extra_vars_dict = json.loads(extra_vars) if isinstance(extra_vars, str) else extra_vars
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            extra_vars_dict["_global_mode"] = True
+
+            message_ts = parameters.get("_message_ts")
+            request = PlaybookRequest.create(
+                user_id=user_id,
+                user_name=user_id,
+                channel_id=channel_id,
+                playbook=playbook_path,
+                inventory=inventory_name,
+                extra_vars=extra_vars_dict,
+                priority=RequestPriority.NORMAL,
+                message_ts=message_ts,
+            )
+
+            success, message = await self._queue.submit(request)
+            host_count = inventory_info.get("total_hosts", 0)
+            thread_msg = (
+                f"🌍 *Global Runbook Submitted*\n\n"
+                f"• Request ID: `{request.id}`\n"
+                f"• Playbook: `{playbook_path}`\n"
+                f"• Inventory: `{inventory_name}` ({host_count} hosts)\n"
+                f"• Mode: *Global* (all hosts)\n\n"
+                f"⏳ {'Starting immediately...' if success else 'Queued...'}\n"
+                f"_Progress updates every {self.global_progress_interval}s in this thread_"
+            )
+
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS if success else MCPResultStatus.ERROR,
+                message="⏳ Global runbook submitted..." if success else message,
+                data={"request_id": request.id if success else None},
+                thread_messages=[thread_msg] if success else [message],
+            )
+
+        # Direct execution (no queue)
+        inv_id = inventory_info.get("id")
+        host_count = inventory_info.get("total_hosts", 0)
+        return await self._execute_playbook_global(
+            playbook=playbook_path,
+            inventory_id=inv_id,
+            inventory_name=inventory_name,
+            host_count=host_count,
+            extra_vars=extra_vars if isinstance(extra_vars, dict) else None,
+            channel_id=channel_id,
+        )
+
+    async def _execute_playbook_global(
+        self,
+        playbook: str,
+        inventory_id: int,
+        inventory_name: str,
+        host_count: int,
+        extra_vars: Optional[Dict[str, Any]] = None,
+        channel_id: Optional[str] = None,
+        message_ts: Optional[str] = None,
+    ) -> MCPResult:
+        """Execute a playbook in global mode (central inventory, long-poll with progress)."""
+        try:
+            # Step 1: Ensure AWX project exists and is synced
+            project_id = await self._ensure_awx_project()
+            if not project_id:
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message="❌ Failed to create AWX project",
+                    thread_messages=["❌ *Error:* Failed to create AWX project. Check AWX credentials."],
+                )
+
+            await self._sync_awx_project(project_id)
+            await self._wait_for_project_sync(project_id)
+
+            # Step 2: Create or get job template
+            template_id = await self._ensure_job_template(
+                playbook=playbook,
+                project_id=project_id,
+                inventory_id=inventory_id,
+            )
+            if not template_id:
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message="❌ Failed to create job template",
+                    thread_messages=["❌ *Error:* Failed to create job template. Check playbook path."],
+                )
+
+            # Step 3: Launch the job (skip Azure var injection for global — mixed inventory)
+            extra_vars_str = None
+            if extra_vars:
+                import json
+                extra_vars_str = json.dumps(extra_vars)
+
+            job = await self._launch_job(template_id, extra_vars_str)
+            if not job:
+                return MCPResult(
+                    status=MCPResultStatus.ERROR,
+                    message="❌ Failed to launch job",
+                    thread_messages=["❌ *Error:* Failed to launch AWX job."],
+                )
+
+            job_id = job.get("id")
+            job_url = f"https://{self.awx_server}/#/jobs/playbook/{job_id}"
+
+            # Step 4: Wait for completion with progress updates
+            final_status, host_status_counts = await self._wait_for_global_job(
+                job_id=job_id,
+                channel_id=channel_id,
+                message_ts=message_ts,
+            )
+
+            # Step 5: Build summary
+            status_emoji = self._get_status_emoji(final_status)
+            result_text = "passed" if final_status == "successful" else "failed"
+
+            # Get elapsed time from job
+            job_details = await self._get_job(job_id)
+            elapsed = job_details.get("elapsed", 0) if job_details else 0
+            minutes = int(elapsed) // 60
+            seconds = int(elapsed) % 60
+            duration_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+            ok_count = host_status_counts.get("ok", 0)
+            changed_count = host_status_counts.get("changed", 0)
+            failed_count = host_status_counts.get("failures", 0)
+            unreachable_count = host_status_counts.get("dark", 0)
+            skipped_count = host_status_counts.get("skipped", 0)
+            ignored_count = host_status_counts.get("ignored", 0)
+            rescued_count = host_status_counts.get("rescued", 0)
+
+            thread_messages = []
+
+            # Summary message
+            summary = (
+                f"{status_emoji} *Global Runbook {'Complete' if final_status == 'successful' else 'Failed'}*\n\n"
+                f"*Playbook:* `{playbook}`\n"
+                f"*Inventory:* `{inventory_name}` ({host_count} hosts)\n"
+                f"*Duration:* {duration_str} | *Job ID:* `{job_id}`\n\n"
+                f"*Host Summary:*\n"
+                f"  OK: {ok_count} | Changed: {changed_count}\n"
+                f"  Failed: {failed_count} | Unreachable: {unreachable_count}\n"
+                f"  Skipped: {skipped_count} | Ignored: {ignored_count}"
+            )
+            if rescued_count:
+                summary += f" | Rescued: {rescued_count}"
+
+            thread_messages.append(summary)
+
+            # Get failed host details if any failures
+            if failed_count > 0 or unreachable_count > 0:
+                failed_hosts_msg = await self._get_failed_hosts(job_id)
+                if failed_hosts_msg:
+                    thread_messages.append(failed_hosts_msg)
+
+            # Main message update
+            main_update = (
+                f"*Result:* {status_emoji} {result_text} | "
+                f"OK: {ok_count} | Failed: {failed_count} | "
+                f"Unreachable: {unreachable_count} | Job: `{job_id}`"
+            )
+
+            return MCPResult(
+                status=MCPResultStatus.SUCCESS if final_status == "successful" else MCPResultStatus.ERROR,
+                message=main_update,
+                data={
+                    "job_id": job_id,
+                    "status": final_status,
+                    "host_status_counts": host_status_counts,
+                },
+                thread_messages=thread_messages,
+                main_message_update=main_update,
+                awx_url=job_url,
+            )
+
+        except Exception as e:
+            logger.exception("Error executing global playbook")
+            return MCPResult(
+                status=MCPResultStatus.ERROR,
+                message=f"❌ Error: {str(e)}",
+                thread_messages=[f"❌ *Error executing global playbook:*\n```\n{str(e)}\n```"],
+            )
+
+    async def _wait_for_global_job(
+        self,
+        job_id: int,
+        channel_id: Optional[str] = None,
+        message_ts: Optional[str] = None,
+    ) -> tuple:
+        """
+        Wait for a global job to complete with progress updates.
+
+        Returns:
+            (status, host_status_counts) tuple
+        """
+        start_time = time.time()
+        last_progress_time = 0
+        timeout = self.global_job_timeout
+        poll_interval = 10  # 10s between API polls (reduce load)
+
+        while time.time() - start_time < timeout:
+            job = await self._get_job(job_id)
+            if not job:
+                return ("error", {})
+
+            status = job.get("status", "unknown")
+            host_status_counts = job.get("host_status_counts", {})
+
+            # Post progress update at configured interval
+            elapsed = time.time() - start_time
+            if (channel_id and self._notify_callback
+                    and elapsed - last_progress_time >= self.global_progress_interval
+                    and status in ("running", "pending", "waiting")):
+
+                total_processed = sum(host_status_counts.values()) if host_status_counts else 0
+                minutes = int(elapsed) // 60
+                seconds = int(elapsed) % 60
+                elapsed_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+                ok = host_status_counts.get("ok", 0)
+                changed = host_status_counts.get("changed", 0)
+                failed = host_status_counts.get("failures", 0)
+                dark = host_status_counts.get("dark", 0)
+
+                progress_msg = (
+                    f"⏳ *Global run progress* ({elapsed_str}):\n"
+                    f"  OK: {ok} | Changed: {changed} | Failed: {failed} | Unreachable: {dark}\n"
+                    f"  Hosts processed: {total_processed}"
+                )
+
+                try:
+                    await self._notify_callback(
+                        channel_id=channel_id,
+                        message=progress_msg,
+                        thread_ts=message_ts,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to post progress update: {e}")
+
+                last_progress_time = elapsed
+
+            # Check if job is done
+            if status in ("successful", "failed", "error", "canceled"):
+                return (status, host_status_counts)
+
+            await asyncio.sleep(poll_interval)
+
+        # Timeout
+        job = await self._get_job(job_id)
+        host_status_counts = job.get("host_status_counts", {}) if job else {}
+        return ("timeout", host_status_counts)
+
+    async def _get_failed_hosts(self, job_id: int) -> Optional[str]:
+        """Get details about failed and unreachable hosts from a job."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                _executor,
+                self._get_failed_hosts_sync,
+                job_id,
+            )
+        except Exception as e:
+            logger.error(f"Error getting failed hosts: {e}")
+            return None
+
+    def _get_failed_hosts_sync(self, job_id: int) -> Optional[str]:
+        """Synchronously get failed/unreachable hosts from AWX job host summaries."""
+        url = f"https://{self.awx_server}/api/v2/jobs/{job_id}/job_host_summaries/"
+
+        try:
+            response = requests.get(
+                url,
+                params={"failed": "True", "page_size": 200},
+                auth=(self.awx_username, self.awx_password),
+                timeout=30,
+                verify=False,
+            )
+            response.raise_for_status()
+            results = response.json().get("results", [])
+
+            failed_hosts = []
+            unreachable_hosts = []
+
+            for summary in results:
+                host_name = summary.get("host_name", "unknown")
+                if summary.get("dark", 0) > 0:
+                    unreachable_hosts.append(host_name)
+                elif summary.get("failures", 0) > 0:
+                    failed_hosts.append(host_name)
+
+            if not failed_hosts and not unreachable_hosts:
+                return None
+
+            lines = []
+            if failed_hosts:
+                display_count = min(len(failed_hosts), 50)
+                lines.append(f"❌ *Failed hosts ({len(failed_hosts)}):*")
+                for host in failed_hosts[:50]:
+                    lines.append(f"  • {host}")
+                if len(failed_hosts) > 50:
+                    lines.append(f"  _... and {len(failed_hosts) - 50} more_")
+
+            if unreachable_hosts:
+                display_count = min(len(unreachable_hosts), 50)
+                lines.append(f"🔇 *Unreachable hosts ({len(unreachable_hosts)}):*")
+                for host in unreachable_hosts[:50]:
+                    lines.append(f"  • {host}")
+                if len(unreachable_hosts) > 50:
+                    lines.append(f"  _... and {len(unreachable_hosts) - 50} more_")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Error fetching host summaries for job {job_id}: {e}")
+            return f"_Could not retrieve failed host details: {str(e)}_"
 
     async def _handle_setup_ssh(self) -> MCPResult:
         """Check and display SSH credential status."""
@@ -1264,7 +1993,7 @@ class AwxPlaybookMCP(BaseMCP):
                             f"⚠️ *SSH Credential Not Found*\n\n"
                             f"Configured ID `{self.awx_credential_id}` does not exist in AWX.\n\n"
                             f"*To fix:*\n"
-                            f"1. Go to AWX: http://{self.awx_server}/#/credentials\n"
+                            f"1. Go to AWX: https://{self.awx_server}/#/credentials\n"
                             f"2. Create a 'Machine' credential with SSH key\n"
                             f"3. Update `AWX_CREDENTIAL_ID` in K8s secrets\n\n"
                             f"_Ready for next task_"
@@ -1295,7 +2024,7 @@ class AwxPlaybookMCP(BaseMCP):
                         message=(
                             f"⚠️ *No SSH Credentials in AWX*\n\n"
                             f"*To fix:*\n"
-                            f"1. Go to AWX: http://{self.awx_server}/#/credentials\n"
+                            f"1. Go to AWX: https://{self.awx_server}/#/credentials\n"
                             f"2. Click 'Add'\n"
                             f"3. Select 'Machine' credential type\n"
                             f"4. Enter name: `vivox-ssh-key`\n"
@@ -1330,11 +2059,12 @@ class AwxPlaybookMCP(BaseMCP):
 
     def _get_credential_sync(self, cred_id: int) -> Optional[Dict[str, Any]]:
         """Synchronously get credential from AWX."""
-        url = f"http://{self.awx_server}/api/v2/credentials/{cred_id}/"
+        url = f"https://{self.awx_server}/api/v2/credentials/{cred_id}/"
         response = requests.get(
             url,
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         if response.status_code == 404:
             return None
@@ -1356,12 +2086,13 @@ class AwxPlaybookMCP(BaseMCP):
     def _list_ssh_credentials_sync(self) -> List[Dict[str, Any]]:
         """Synchronously list SSH credentials from AWX."""
         # First get Machine credential type ID
-        type_url = f"http://{self.awx_server}/api/v2/credential_types/"
+        type_url = f"https://{self.awx_server}/api/v2/credential_types/"
         type_response = requests.get(
             type_url,
             params={"name": "Machine"},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         type_response.raise_for_status()
         types = type_response.json().get("results", [])
@@ -1370,12 +2101,13 @@ class AwxPlaybookMCP(BaseMCP):
         machine_type_id = types[0]["id"]
 
         # Get credentials of that type
-        url = f"http://{self.awx_server}/api/v2/credentials/"
+        url = f"https://{self.awx_server}/api/v2/credentials/"
         response = requests.get(
             url,
             params={"credential_type": machine_type_id},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
         return response.json().get("results", [])
@@ -1395,9 +2127,274 @@ class AwxPlaybookMCP(BaseMCP):
         }
         return status_emojis.get(status.lower(), "❓")
 
+    def _diagnose_failure(self, output: str, raw_output: str = "") -> tuple:
+        """
+        Analyze job output and return diagnosis and solution.
+
+        Returns:
+            (diagnosis, solution) tuple
+        """
+        combined_output = f"{output}\n{raw_output}".lower()
+
+        # Error patterns ordered by specificity (most specific first)
+        error_patterns = [
+            # Project sync / SCM update failure (job never ran)
+            {
+                "patterns": ["previous task failed", "project_update", "authentication failed", "anonymous access denied"],
+                "diagnosis": "AWX project sync failed (Git authentication error)",
+                "solution": (
+                    "AWX could not pull the latest playbooks from GitHub. Possible causes:\n"
+                    "• GitHub token expired or invalid\n"
+                    "• SCM credential username is empty (must be 'git')\n"
+                    "• GitHub Enterprise is unreachable from AWX\n\n"
+                    "To fix:\n"
+                    "1. Check AWX project sync status in the AWX UI\n"
+                    "2. Update the GitHub token: `/awx setup ssh`\n"
+                    "3. Verify the SCM credential has username='git' and a valid token\n"
+                    "4. Try syncing the project manually in AWX"
+                ),
+            },
+            # APT/Package manager errors
+            {
+                "patterns": ["apt cache", "apt-get update", "failed to update apt", "apt update"],
+                "diagnosis": "Package manager failure",
+                "solution": (
+                    "APT cache update failed. Possible causes:\n"
+                    "• Network access to apt repositories is blocked\n"
+                    "• apt is locked by another process\n"
+                    "• Repository configuration issues in /etc/apt/sources.list\n"
+                    "• DNS resolution issues for apt mirrors\n\n"
+                    "To fix:\n"
+                    "1. SSH to the host and run: `sudo apt-get update`\n"
+                    "2. Check if apt lock exists: `sudo lsof /var/lib/apt/lists/lock`\n"
+                    "3. Verify network access: `curl -I http://archive.ubuntu.com`"
+                ),
+            },
+            # DNS resolution errors
+            {
+                "patterns": ["could not resolve host", "name or service not known", "temporary failure in name resolution"],
+                "diagnosis": "DNS resolution failure",
+                "solution": (
+                    "The host cannot resolve DNS names. Possible causes:\n"
+                    "• DNS server is unreachable\n"
+                    "• /etc/resolv.conf misconfigured\n"
+                    "• Network connectivity issues\n\n"
+                    "To fix:\n"
+                    "1. Check DNS config: `cat /etc/resolv.conf`\n"
+                    "2. Test DNS: `nslookup google.com`\n"
+                    "3. Verify network: `ping 8.8.8.8`"
+                ),
+            },
+            # SSH/Connection errors - host unreachable
+            {
+                "patterns": ["unreachable", "connection refused", "connection timed out", "no route to host"],
+                "diagnosis": "Host unreachable - connectivity failure",
+                "solution": (
+                    "The playbook cannot connect to the target hosts. Possible causes:\n"
+                    "• Host is down or unreachable\n"
+                    "• Firewall blocking SSH (port 22)\n"
+                    "• Wrong IP address in inventory\n\n"
+                    "To fix:\n"
+                    "1. Verify host is running and reachable\n"
+                    "2. Check network connectivity\n"
+                    "3. Verify SSH port is open"
+                ),
+            },
+            # SSH authentication errors
+            {
+                "patterns": ["permission denied (publickey", "authentication failed", "no supported authentication"],
+                "diagnosis": "SSH authentication failure",
+                "solution": (
+                    "SSH key authentication failed. Possible causes:\n"
+                    "• SSH credential not configured in AWX\n"
+                    "• Wrong SSH key for this host\n"
+                    "• User not authorized on target host\n\n"
+                    "To fix:\n"
+                    "1. Check AWX credential configuration\n"
+                    "2. Verify SSH key is added to target host\n"
+                    "3. Run `setup ssh` to check credential status"
+                ),
+            },
+            # Incorrect sudo password (Azure hosts)
+            {
+                "patterns": ["incorrect sudo password", "sorry, try again", "sudo: 1 incorrect password attempt"],
+                "diagnosis": "Incorrect sudo password",
+                "solution": (
+                    "The sudo password provided is incorrect. For Azure hosts (10.253.x.x):\n"
+                    "• The AZURE_SUDO_PASSWORD environment variable may be wrong\n"
+                    "• The password may have changed on the target host\n\n"
+                    "To fix:\n"
+                    "1. Verify the correct sudo password for vivoxops user\n"
+                    "2. Update AZURE_SUDO_PASSWORD in K8s secrets\n"
+                    "3. Restart the slack-mcp-agent pod"
+                ),
+            },
+            # Sudo/Permission errors
+            {
+                "patterns": ["sudo: a password is required", "permission denied", "requires become", "must be run as root"],
+                "diagnosis": "Insufficient permissions",
+                "solution": (
+                    "The task requires elevated privileges. Possible causes:\n"
+                    "• User doesn't have sudo access\n"
+                    "• become/sudo not enabled in playbook\n"
+                    "• sudo password required but not provided\n\n"
+                    "To fix:\n"
+                    "1. Verify user has sudo access on target\n"
+                    "2. Check playbook has `become: yes`\n"
+                    "3. Configure sudo password in AWX credentials"
+                ),
+            },
+            # File/Path errors
+            {
+                "patterns": ["no such file or directory", "file not found", "path does not exist"],
+                "diagnosis": "File or path not found",
+                "solution": (
+                    "A required file or path doesn't exist. Possible causes:\n"
+                    "• Playbook path is incorrect\n"
+                    "• Required files not present on target\n"
+                    "• Template or variable file missing\n\n"
+                    "To fix:\n"
+                    "1. Verify playbook path in GitHub repo\n"
+                    "2. Check required files exist on target host\n"
+                    "3. Review playbook for hardcoded paths"
+                ),
+            },
+            # Disk space errors
+            {
+                "patterns": ["no space left on device", "disk quota exceeded", "cannot allocate memory"],
+                "diagnosis": "Disk space or memory issue",
+                "solution": (
+                    "The host has insufficient resources. Possible causes:\n"
+                    "• Disk is full\n"
+                    "• Disk quota exceeded\n"
+                    "• Out of memory\n\n"
+                    "To fix:\n"
+                    "1. Check disk space: `df -h`\n"
+                    "2. Clean up old files/logs\n"
+                    "3. Check memory: `free -m`"
+                ),
+            },
+            # Timeout errors
+            {
+                "patterns": ["timeout", "timed out", "deadline exceeded"],
+                "diagnosis": "Operation timed out",
+                "solution": (
+                    "The operation took too long. Possible causes:\n"
+                    "• Slow network connection\n"
+                    "• Large download/operation\n"
+                    "• Host under heavy load\n\n"
+                    "To fix:\n"
+                    "1. Increase task timeout in playbook\n"
+                    "2. Check host resource usage\n"
+                    "3. Run task manually to diagnose"
+                ),
+            },
+            # Docker errors
+            {
+                "patterns": ["docker daemon", "docker: error", "container", "image not found", "pull access denied"],
+                "diagnosis": "Docker operation failed",
+                "solution": (
+                    "A Docker operation failed. Possible causes:\n"
+                    "• Docker daemon not running\n"
+                    "• Image not found or access denied\n"
+                    "• Container configuration issue\n\n"
+                    "To fix:\n"
+                    "1. Check Docker status: `systemctl status docker`\n"
+                    "2. Verify image exists and credentials are correct\n"
+                    "3. Check container logs: `docker logs <container>`"
+                ),
+            },
+            # Service errors
+            {
+                "patterns": ["service", "systemctl", "failed to start", "failed to enable"],
+                "diagnosis": "Service operation failed",
+                "solution": (
+                    "A service operation failed. Possible causes:\n"
+                    "• Service configuration error\n"
+                    "• Missing dependencies\n"
+                    "• Port already in use\n\n"
+                    "To fix:\n"
+                    "1. Check service status: `systemctl status <service>`\n"
+                    "2. View logs: `journalctl -u <service>`\n"
+                    "3. Verify configuration files"
+                ),
+            },
+        ]
+
+        # Check each pattern
+        for error in error_patterns:
+            for pattern in error["patterns"]:
+                if pattern in combined_output:
+                    return (error["diagnosis"], error["solution"])
+
+        # Default diagnosis if no pattern matches
+        return (
+            "Unknown failure",
+            (
+                "The playbook failed for an unrecognized reason.\n\n"
+                "To diagnose:\n"
+                "1. Review the full output above\n"
+                "2. Check AWX job details for more context\n"
+                "3. Run the playbook manually with verbose mode: `-vvv`"
+            )
+        )
+
+    def _is_azure_inventory(self, inventory_id: int) -> bool:
+        """
+        Check if inventory contains Azure hosts (IPs starting with 10.253.x.x).
+
+        Azure hosts require different SSH settings:
+        - Username: vivoxops (instead of root)
+        - Become: sudo with password
+        """
+        try:
+            url = f"https://{self.awx_server}/api/v2/inventories/{inventory_id}/hosts/"
+            response = requests.get(
+                url,
+                auth=(self.awx_username, self.awx_password),
+                timeout=30,
+                verify=False
+            )
+            response.raise_for_status()
+
+            hosts = response.json().get("results", [])
+            for host in hosts:
+                # Check host variables for ansible_host IP
+                variables = host.get("variables", "")
+                if isinstance(variables, str):
+                    try:
+                        import json
+                        variables = json.loads(variables) if variables else {}
+                    except json.JSONDecodeError:
+                        variables = {}
+
+                # Check ansible_host or the host name itself
+                ansible_host = variables.get("ansible_host", "")
+                host_name = host.get("name", "")
+
+                # Check if IP starts with 10.253
+                if ansible_host.startswith("10.253.") or host_name.startswith("10.253."):
+                    logger.info(f"Detected Azure host in inventory {inventory_id}: {host_name} ({ansible_host})")
+                    return True
+
+            return False
+        except Exception as e:
+            logger.error(f"Error checking Azure inventory: {e}")
+            return False
+
+    def _get_azure_extra_vars(self) -> Dict[str, Any]:
+        """Get extra vars for Azure hosts (vivoxops user with sudo)."""
+        return {
+            "ansible_user": "vivoxops",
+            "ansible_become": True,
+            "ansible_become_method": "sudo",
+            "ansible_become_password": self.azure_sudo_password,
+        }
+
     def _format_ansible_output(self, output: str) -> str:
         """Parse and format Ansible output for better Slack readability."""
         import re
+        import json
 
         # Remove ANSI color codes if any
         output = re.sub(r'\x1b\[[0-9;]*m', '', output)
@@ -1412,9 +2409,17 @@ class AwxPlaybookMCP(BaseMCP):
         current_task = ""
         services_found = []
         hosts_summary = {}
+        last_was_fatal = False
 
         for line in lines:
             line = line.strip()
+
+            # Handle "...ignoring" on its own line after a fatal
+            if line == '...ignoring' and last_was_fatal:
+                if formatted_lines:
+                    formatted_lines.append(f"   (ignored)")
+                last_was_fatal = False
+                continue
 
             # Skip deprecation warnings and empty lines
             if not line or '[DEPRECATION WARNING]' in line or line.startswith('deprecation_warnings'):
@@ -1443,6 +2448,7 @@ class AwxPlaybookMCP(BaseMCP):
 
             # Capture task results
             if line.startswith('ok:') or line.startswith('changed:'):
+                last_was_fatal = False
                 host = re.search(r'\[(.+?)\]', line)
                 if host:
                     host_name = host.group(1)
@@ -1461,12 +2467,67 @@ class AwxPlaybookMCP(BaseMCP):
                     if host_name not in hosts_summary:
                         hosts_summary[host_name] = {'ok': 0, 'changed': 0, 'failed': 0}
                     hosts_summary[host_name]['failed'] += 1
-                    # Include error message
+                    last_was_fatal = True
+                    # Include error message with useful detail
                     formatted_lines.append(f"❌ {host_name}: {current_task}")
-                    # Try to extract error message
-                    error_match = re.search(r'"msg":\s*"(.+?)"', line)
-                    if error_match:
-                        formatted_lines.append(f"   Error: {error_match.group(1)[:200]}")
+
+                    # Try to parse the JSON result from the fatal line
+                    json_match = re.search(r'=>\s*(\{.+)', line)
+                    if json_match:
+                        try:
+                            result_data = json.loads(json_match.group(1))
+                            # Build useful error info from available fields
+                            error_parts = []
+
+                            # Show the command that was run
+                            cmd = result_data.get("cmd")
+                            if cmd:
+                                if isinstance(cmd, list):
+                                    cmd = " ".join(cmd)
+                                error_parts.append(f"Command: {str(cmd)[:150]}")
+
+                            # stderr is usually the most useful
+                            stderr = result_data.get("stderr", "").strip()
+                            if stderr:
+                                # Take last meaningful line of stderr
+                                stderr_lines = [l.strip() for l in stderr.split('\n') if l.strip()]
+                                if stderr_lines:
+                                    error_parts.append(f"stderr: {stderr_lines[-1][:200]}")
+
+                            # msg as fallback (but skip generic "non-zero return code")
+                            msg = result_data.get("msg", "").strip()
+                            if msg and msg != "non-zero return code":
+                                error_parts.append(f"Error: {msg[:200]}")
+                            elif msg == "non-zero return code":
+                                rc = result_data.get("rc", "?")
+                                error_parts.append(f"Exit code: {rc}")
+
+                            # stdout can have useful info too
+                            stdout = result_data.get("stdout", "").strip()
+                            if stdout and not stderr:
+                                stdout_lines = [l.strip() for l in stdout.split('\n') if l.strip()]
+                                if stdout_lines:
+                                    error_parts.append(f"Output: {stdout_lines[-1][:200]}")
+
+                            for part in error_parts:
+                                formatted_lines.append(f"   {part}")
+
+                            if not error_parts:
+                                formatted_lines.append(f"   Error: {msg or 'unknown'}")
+                        except (json.JSONDecodeError, TypeError):
+                            # Fall back to regex extraction
+                            error_match = re.search(r'"msg":\s*"(.+?)"', line)
+                            if error_match:
+                                formatted_lines.append(f"   Error: {error_match.group(1)[:200]}")
+                    else:
+                        # No JSON found, try simple regex
+                        error_match = re.search(r'"msg":\s*"(.+?)"', line)
+                        if error_match:
+                            formatted_lines.append(f"   Error: {error_match.group(1)[:200]}")
+
+                    # Check if task was ignored (ignore_errors: yes)
+                    if '...ignoring' in line:
+                        formatted_lines.append(f"   (ignored)")
                 continue
 
             if line.startswith('skipping:'):
@@ -1630,12 +2691,13 @@ class AwxPlaybookMCP(BaseMCP):
 
     def _get_inventory_sync(self, name: str) -> Optional[Dict[str, Any]]:
         """Synchronously get inventory from AWX."""
-        url = f"http://{self.awx_server}/api/v2/inventories/"
+        url = f"https://{self.awx_server}/api/v2/inventories/"
         response = requests.get(
             url,
             params={"name": name},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -1664,12 +2726,13 @@ class AwxPlaybookMCP(BaseMCP):
         project_name = f"slack-bot-{self.github_repo.replace('/', '-')}"
 
         # Check if project exists
-        url = f"http://{self.awx_server}/api/v2/projects/"
+        url = f"https://{self.awx_server}/api/v2/projects/"
         response = requests.get(
             url,
             params={"name": project_name},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -1685,7 +2748,7 @@ class AwxPlaybookMCP(BaseMCP):
                 scm_credential_id = self._ensure_scm_credential(org_id)
                 if scm_credential_id:
                     # Update project with credential
-                    update_url = f"http://{self.awx_server}/api/v2/projects/{project_id}/"
+                    update_url = f"https://{self.awx_server}/api/v2/projects/{project_id}/"
                     requests.patch(
                         update_url,
                         json={"credential": scm_credential_id},
@@ -1697,11 +2760,12 @@ class AwxPlaybookMCP(BaseMCP):
             return project_id
 
         # Get organization ID
-        org_url = f"http://{self.awx_server}/api/v2/organizations/"
+        org_url = f"https://{self.awx_server}/api/v2/organizations/"
         org_response = requests.get(
             org_url,
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         org_response.raise_for_status()
         org_id = org_response.json().get("results", [{}])[0].get("id", 1)
@@ -1713,7 +2777,10 @@ class AwxPlaybookMCP(BaseMCP):
 
         # Create project
         # Build the full GitHub URL for SCM
-        github_base = self.github_api_url.replace("/api/v3", "")
+        if "api.github.com" in self.github_api_url:
+            github_base = "https://github.com"
+        else:
+            github_base = self.github_api_url.replace("/api/v3", "")
         scm_url = f"{github_base}/{self.github_repo}.git"
 
         payload = {
@@ -1734,7 +2801,8 @@ class AwxPlaybookMCP(BaseMCP):
             url,
             json=payload,
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -1742,15 +2810,16 @@ class AwxPlaybookMCP(BaseMCP):
 
     def _ensure_scm_credential(self, org_id: int) -> Optional[int]:
         """Create or get SCM credential for GitHub authentication."""
-        credential_name = "slack-bot-github-token"
+        credential_name = self._scm_credential_name
 
         # Check if credential exists
-        url = f"http://{self.awx_server}/api/v2/credentials/"
+        url = f"https://{self.awx_server}/api/v2/credentials/"
         response = requests.get(
             url,
             params={"name": credential_name},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -1758,22 +2827,24 @@ class AwxPlaybookMCP(BaseMCP):
         if results:
             # Update existing credential with current token
             cred_id = results[0]["id"]
-            update_url = f"http://{self.awx_server}/api/v2/credentials/{cred_id}/"
+            update_url = f"https://{self.awx_server}/api/v2/credentials/{cred_id}/"
             requests.patch(
                 update_url,
-                json={"inputs": {"password": self.github_token}},
+                json={"inputs": {"username": "git", "password": self.github_token}},
                 auth=(self.awx_username, self.awx_password),
-                timeout=30
+                timeout=30,
+                verify=False
             )
             return cred_id
 
         # Get credential type ID for "Source Control"
-        cred_type_url = f"http://{self.awx_server}/api/v2/credential_types/"
+        cred_type_url = f"https://{self.awx_server}/api/v2/credential_types/"
         cred_type_response = requests.get(
             cred_type_url,
             params={"name": "Source Control"},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         cred_type_response.raise_for_status()
         cred_types = cred_type_response.json().get("results", [])
@@ -1798,7 +2869,8 @@ class AwxPlaybookMCP(BaseMCP):
             url,
             json=payload,
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -1819,18 +2891,50 @@ class AwxPlaybookMCP(BaseMCP):
 
     def _sync_awx_project_sync(self, project_id: int) -> bool:
         """Synchronously trigger a project sync."""
-        url = f"http://{self.awx_server}/api/v2/projects/{project_id}/update/"
+        url = f"https://{self.awx_server}/api/v2/projects/{project_id}/update/"
         try:
             response = requests.post(
                 url,
                 auth=(self.awx_username, self.awx_password),
-                timeout=30
+                timeout=30,
+                verify=False
             )
             # 202 Accepted is success for async operations
             return response.status_code in [200, 201, 202]
         except Exception as e:
             logger.error(f"Error syncing project: {e}")
             return False
+
+    async def _wait_for_project_sync(self, project_id: int, timeout: int = 60) -> bool:
+        """Wait for AWX project sync to complete."""
+        import time
+        start = time.time()
+        url = f"https://{self.awx_server}/api/v2/projects/{project_id}/"
+        while time.time() - start < timeout:
+            try:
+                loop = asyncio.get_event_loop()
+                status = await loop.run_in_executor(
+                    _executor,
+                    lambda: requests.get(
+                        url,
+                        auth=(self.awx_username, self.awx_password),
+                        timeout=30,
+                        verify=False
+                    ).json().get("status", "unknown")
+                )
+                if status == "successful":
+                    logger.info(f"Project {project_id} sync completed")
+                    return True
+                if status in ("failed", "error", "canceled"):
+                    logger.error(f"Project {project_id} sync failed with status: {status}")
+                    return False
+                # Still running/pending/waiting
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error(f"Error checking project sync status: {e}")
+                return False
+        logger.warning(f"Project {project_id} sync timed out after {timeout}s")
+        return False
 
     async def _ensure_job_template(
         self,
@@ -1864,12 +2968,13 @@ class AwxPlaybookMCP(BaseMCP):
         template_name = f"slack-bot-{playbook_base}"
 
         # Check if template exists
-        url = f"http://{self.awx_server}/api/v2/job_templates/"
+        url = f"https://{self.awx_server}/api/v2/job_templates/"
         response = requests.get(
             url,
             params={"name": template_name},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -1878,14 +2983,27 @@ class AwxPlaybookMCP(BaseMCP):
             template = results[0]
             template_id = template["id"]
 
-            # Update inventory if different
+            # Update inventory and execution environment if different
+            update_payload = {}
             if template.get("inventory") != inventory_id:
-                update_url = f"http://{self.awx_server}/api/v2/job_templates/{template_id}/"
+                update_payload["inventory"] = inventory_id
+
+            # Ensure execution environment is set
+            if self.awx_execution_environment_id:
+                ee_id = int(self.awx_execution_environment_id)
+                current_ee = template.get("execution_environment")
+                if current_ee != ee_id:
+                    update_payload["execution_environment"] = ee_id
+                    logger.info(f"Updating template {template_id} to use EE {ee_id}")
+
+            if update_payload:
+                update_url = f"https://{self.awx_server}/api/v2/job_templates/{template_id}/"
                 requests.patch(
                     update_url,
-                    json={"inventory": inventory_id},
+                    json=update_payload,
                     auth=(self.awx_username, self.awx_password),
-                    timeout=30
+                    timeout=30,
+                    verify=False
                 )
 
             # Ensure credential is attached (AWX uses separate endpoint)
@@ -1895,7 +3013,7 @@ class AwxPlaybookMCP(BaseMCP):
                 cred_id = int(self.awx_credential_id)
 
                 if cred_id not in cred_ids:
-                    cred_url = f"http://{self.awx_server}/api/v2/job_templates/{template_id}/credentials/"
+                    cred_url = f"https://{self.awx_server}/api/v2/job_templates/{template_id}/credentials/"
                     try:
                         requests.post(
                             cred_url,
@@ -1922,25 +3040,35 @@ class AwxPlaybookMCP(BaseMCP):
             "ask_variables_on_launch": True,
         }
 
+        # Add execution environment if configured
+        if self.awx_execution_environment_id:
+            payload["execution_environment"] = int(self.awx_execution_environment_id)
+            logger.info(f"Creating template with EE {self.awx_execution_environment_id}")
+
+        logger.info(f"Creating job template: {payload}")
         response = requests.post(
             url,
             json=payload,
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
+        if response.status_code >= 400:
+            logger.error(f"Job template creation failed ({response.status_code}): {response.text}")
         response.raise_for_status()
 
         template_id = response.json().get("id")
 
         # Attach credential via separate endpoint (AWX requires this)
         if self.awx_credential_id and template_id:
-            cred_url = f"http://{self.awx_server}/api/v2/job_templates/{template_id}/credentials/"
+            cred_url = f"https://{self.awx_server}/api/v2/job_templates/{template_id}/credentials/"
             try:
                 requests.post(
                     cred_url,
                     json={"id": int(self.awx_credential_id)},
                     auth=(self.awx_username, self.awx_password),
-                    timeout=30
+                    timeout=30,
+                    verify=False
                 )
                 logger.info(f"Attached credential {self.awx_credential_id} to template {template_id}")
             except Exception as e:
@@ -1972,7 +3100,7 @@ class AwxPlaybookMCP(BaseMCP):
         extra_vars: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Synchronously launch a job."""
-        url = f"http://{self.awx_server}/api/v2/job_templates/{template_id}/launch/"
+        url = f"https://{self.awx_server}/api/v2/job_templates/{template_id}/launch/"
 
         payload = {}
         if extra_vars:
@@ -1982,7 +3110,8 @@ class AwxPlaybookMCP(BaseMCP):
             url,
             json=payload,
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -2003,12 +3132,13 @@ class AwxPlaybookMCP(BaseMCP):
 
     def _get_job_sync(self, job_id: int) -> Optional[Dict[str, Any]]:
         """Synchronously get job details."""
-        url = f"http://{self.awx_server}/api/v2/jobs/{job_id}/"
+        url = f"https://{self.awx_server}/api/v2/jobs/{job_id}/"
 
         response = requests.get(
             url,
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
 
         if response.status_code == 404:
@@ -2033,13 +3163,14 @@ class AwxPlaybookMCP(BaseMCP):
 
     def _get_job_output_sync(self, job_id: int, lines: int = 50) -> Optional[str]:
         """Synchronously get job output."""
-        url = f"http://{self.awx_server}/api/v2/jobs/{job_id}/stdout/"
+        url = f"https://{self.awx_server}/api/v2/jobs/{job_id}/stdout/"
 
         response = requests.get(
             url,
             params={"format": "txt"},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
 
         if response.status_code == 404:
@@ -2070,13 +3201,14 @@ class AwxPlaybookMCP(BaseMCP):
 
     def _list_jobs_sync(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Synchronously list recent jobs."""
-        url = f"http://{self.awx_server}/api/v2/jobs/"
+        url = f"https://{self.awx_server}/api/v2/jobs/"
 
         response = requests.get(
             url,
             params={"order_by": "-created", "page_size": limit},
             auth=(self.awx_username, self.awx_password),
-            timeout=30
+            timeout=30,
+            verify=False
         )
         response.raise_for_status()
 
@@ -2087,9 +3219,10 @@ class AwxPlaybookMCP(BaseMCP):
         try:
             # Check AWX
             response = requests.get(
-                f"http://{self.awx_server}/api/v2/ping/",
+                f"https://{self.awx_server}/api/v2/ping/",
                 auth=(self.awx_username, self.awx_password),
-                timeout=10
+                timeout=10,
+                verify=False
             )
             return response.status_code == 200
         except Exception:

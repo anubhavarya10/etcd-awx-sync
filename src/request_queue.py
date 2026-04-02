@@ -62,6 +62,7 @@ class PlaybookRequest:
     result: Optional[Any] = field(compare=False, default=None)
     error: Optional[str] = field(compare=False, default=None)
     job_id: Optional[int] = field(compare=False, default=None)
+    message_ts: Optional[str] = field(compare=False, default=None)  # Main message timestamp for threading
 
     @classmethod
     def create(
@@ -73,6 +74,7 @@ class PlaybookRequest:
         inventory: str,
         extra_vars: Optional[Dict[str, Any]] = None,
         priority: RequestPriority = RequestPriority.NORMAL,
+        message_ts: Optional[str] = None,
     ) -> "PlaybookRequest":
         """Factory method to create a new request."""
         request_id = str(uuid.uuid4())[:8]
@@ -88,6 +90,7 @@ class PlaybookRequest:
             extra_vars=extra_vars or {},
             priority=priority,
             submitted_at=submitted,
+            message_ts=message_ts,
         )
 
     @property
@@ -360,7 +363,7 @@ class RequestQueue:
         # Execute outside the lock
         logger.info(f"Starting request {request.id}: {request.playbook} on {request.inventory}")
 
-        # Notify user that their request is starting
+        # Notify user that their request is starting (in thread if available)
         if self.notify_callback:
             try:
                 await self.notify_callback(
@@ -369,9 +372,10 @@ class RequestQueue:
                         f"🚀 *Starting Request `{request.id}`*\n\n"
                         f"• Playbook: `{request.playbook}`\n"
                         f"• Inventory: `{request.inventory}`\n"
-                        f"• Requested by: @{request.user_name}\n\n"
+                        f"• Requested by: <@{request.user_id}>\n\n"
                         f"⏳ Running..."
-                    )
+                    ),
+                    thread_ts=request.message_ts,
                 )
             except Exception as e:
                 logger.error(f"Failed to notify start: {e}")
@@ -385,9 +389,18 @@ class RequestQueue:
                     extra_vars=request.extra_vars,
                     user_id=request.user_id,
                     channel_id=request.channel_id,
+                    message_ts=request.message_ts,
                 )
                 request.result = result
-                request.status = RequestStatus.COMPLETED
+                # Set status based on result
+                if hasattr(result, 'status'):
+                    from .mcps.base import MCPResultStatus
+                    if result.status == MCPResultStatus.SUCCESS:
+                        request.status = RequestStatus.COMPLETED
+                    else:
+                        request.status = RequestStatus.FAILED
+                else:
+                    request.status = RequestStatus.COMPLETED
                 if hasattr(result, 'data') and result.data:
                     request.job_id = result.data.get('job_id')
             else:
@@ -408,13 +421,39 @@ class RequestQueue:
             if len(self._completed) > self._max_history:
                 self._completed = self._completed[-self._max_history:]
 
-        # Notify completion
+        # Notify completion with thread messages and main message update
         if self.notify_callback and request.result:
             try:
-                await self.notify_callback(
-                    channel_id=request.channel_id,
-                    message=request.result.message if hasattr(request.result, 'message') else str(request.result),
-                )
+                result = request.result
+
+                # Post thread messages (detailed info)
+                if hasattr(result, 'thread_messages') and result.thread_messages:
+                    for thread_msg in result.thread_messages:
+                        await self.notify_callback(
+                            channel_id=request.channel_id,
+                            message=thread_msg,
+                            thread_ts=request.message_ts,
+                        )
+
+                # Update main message with result and AWX link
+                if hasattr(result, 'main_message_update') and result.main_message_update:
+                    awx_link = ""
+                    if hasattr(result, 'awx_url') and result.awx_url:
+                        awx_link = f" | <{result.awx_url}|View in AWX>"
+
+                    await self.notify_callback(
+                        channel_id=request.channel_id,
+                        message=f"{result.main_message_update}{awx_link}",
+                        update_ts=request.message_ts,  # Signal to update the message
+                    )
+                elif hasattr(result, 'message'):
+                    # Fallback: post to thread if no main_message_update
+                    await self.notify_callback(
+                        channel_id=request.channel_id,
+                        message=result.message,
+                        thread_ts=request.message_ts,
+                    )
+
             except Exception as e:
                 logger.error(f"Failed to notify completion: {e}")
 

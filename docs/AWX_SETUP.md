@@ -84,7 +84,7 @@ This guide explains how to set up the etcd-to-AWX sync to run directly from AWX.
    - **Name**: `etcd-awx-sync`
    - **Organization**: Select your organization
    - **Source Control Type**: `Git`
-   - **Source Control URL**: `https://github.com/anubhavarya10/etcd-awx-sync.git`
+   - **Source Control URL**: `https://github.cds.internal.unity3d.com/anubhav-arya/vops-bot.git`
    - **Source Control Branch**: `main`
    - **Options**: Check `Clean`, `Update Revision on Launch`
 4. Click **Save**
@@ -180,6 +180,6 @@ Ensure the execution environment has the required Python packages. You may need 
 
 | Item | Value |
 |------|-------|
-| Repository | https://github.com/anubhavarya10/etcd-awx-sync.git |
+| Repository | https://github.cds.internal.unity3d.com/anubhav-arya/vops-bot.git |
 | Playbook | playbooks/sync_inventory.yml |
 | Branch | main |

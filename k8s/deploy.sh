@@ -37,7 +37,10 @@ kubectl create secret generic slack-mcp-agent-secrets \
     --from-literal=AWX_CLIENT_ID="$AWX_CLIENT_ID" \
     --from-literal=AWX_CLIENT_SECRET="$AWX_CLIENT_SECRET" \
     --from-literal=AWX_USERNAME="$AWX_USERNAME" \
-    --from-literal=AWX_PASSWORD="$AWX_PASSWORD"
+    --from-literal=AWX_PASSWORD="$AWX_PASSWORD" \
+    --from-literal=AZURE_SUDO_PASSWORD="$AZURE_SUDO_PASSWORD" \
+    --from-literal=GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+    --from-literal=TF_GITHUB_TOKEN="${TF_GITHUB_TOKEN:-}"
 
 # Apply deployment
 kubectl apply -f deployment.yaml

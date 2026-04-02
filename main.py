@@ -27,6 +27,7 @@ from src.agent import create_agent_from_env, SlackMCPAgent
 from src.mcps import register_mcp
 from src.mcps.etcd_awx import EtcdAwxMCP
 from src.mcps.awx_playbook import AwxPlaybookMCP
+from src.mcps.remote import create_remote_mcp
 
 
 # Global agent reference for health checks
@@ -39,23 +40,18 @@ async def health_handler(request):
 
 
 async def ready_handler(request):
-    """Readiness check endpoint for K8s readiness probe."""
+    """Readiness check endpoint for K8s readiness probe.
+
+    Kept lightweight — only checks that the agent is initialized.
+    Remote MCP health is NOT checked here to avoid cascading
+    HTTP calls that can exceed the probe timeout.
+    """
     global _agent
 
     if _agent is None:
         return web.Response(text="Agent not initialized", status=503)
 
-    try:
-        health = await _agent.health_check()
-        if health["status"] == "healthy":
-            return web.Response(text="Ready", status=200)
-        else:
-            return web.Response(
-                text=f"Degraded: {health}",
-                status=503
-            )
-    except Exception as e:
-        return web.Response(text=f"Error: {e}", status=503)
+    return web.Response(text="Ready", status=200)
 
 
 async def start_health_server():
@@ -118,6 +114,32 @@ async def main():
     except Exception as e:
         logger.error(f"Failed to register awx-playbook MCP: {e}")
         # Continue without this MCP
+
+    # Register remote MCPs from environment
+    # Format: REMOTE_MCP_<NAME>=<URL>
+    # Example: REMOTE_MCP_SERVICE_MANAGER=http://service-manager:8081
+    # Optional timeout: REMOTE_MCP_<NAME>_TIMEOUT=<seconds>
+    remote_mcps = []
+    for key, value in os.environ.items():
+        if key.startswith("REMOTE_MCP_") and not key.endswith("_TIMEOUT"):
+            mcp_name = key.replace("REMOTE_MCP_", "").lower().replace("_", "-")
+            mcp_url = value
+            # Check for per-MCP timeout override
+            timeout_key = f"{key}_TIMEOUT"
+            timeout = int(os.environ.get(timeout_key, "60"))
+            remote_mcps.append((mcp_name, mcp_url, timeout))
+
+    for mcp_name, mcp_url, timeout in remote_mcps:
+        try:
+            logger.info(f"Connecting to remote MCP: {mcp_name} at {mcp_url} (timeout: {timeout}s)")
+            remote_mcp = await create_remote_mcp(mcp_name, mcp_url, timeout=timeout)
+            if remote_mcp:
+                register_mcp(remote_mcp)
+                logger.info(f"Registered remote MCP: {mcp_name}")
+            else:
+                logger.warning(f"Failed to connect to remote MCP: {mcp_name}")
+        except Exception as e:
+            logger.error(f"Failed to register remote MCP {mcp_name}: {e}")
 
     # Create agent
     logger.info("Creating Slack agent...")

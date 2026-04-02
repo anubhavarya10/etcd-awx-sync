@@ -1,6 +1,6 @@
 """MCP Registry for managing multiple MCP implementations."""
 
-from typing import Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 from .base import BaseMCP, MCPResult, MCPResultStatus
 import logging
 
@@ -73,6 +73,7 @@ class MCPRegistry:
         parameters: Dict,
         user_id: str,
         channel_id: str,
+        message_ts: Optional[str] = None,
     ) -> MCPResult:
         """
         Route an action to the appropriate MCP.
@@ -83,6 +84,7 @@ class MCPRegistry:
             parameters: Action parameters
             user_id: Slack user ID
             channel_id: Slack channel ID
+            message_ts: Main message timestamp for threading
 
         Returns:
             MCPResult from the MCP
@@ -101,6 +103,10 @@ class MCPRegistry:
                 status=MCPResultStatus.ERROR,
                 message=f"Unknown action '{action}' for MCP '{mcp_name}'. Available: {', '.join(available)}"
             )
+
+        # Add message_ts to parameters for MCP to use
+        if message_ts:
+            parameters["_message_ts"] = message_ts
 
         try:
             return await mcp.execute(action, parameters, user_id, channel_id)

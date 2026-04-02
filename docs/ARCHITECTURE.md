@@ -17,7 +17,7 @@ MCPs are modular handlers that encapsulate specific functionality. Each MCP:
 
 ### LLM Integration
 
-The agent uses an LLM (Unity AI / Claude) to:
+The agent uses an LLM to:
 
 1. Parse natural language into structured intents
 2. Extract relevant parameters

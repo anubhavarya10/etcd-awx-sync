@@ -71,6 +71,10 @@ class MCPResult:
         data: Operation result data
         confirmation_prompt: If needs_confirmation, the prompt to show user
         action_id: Unique ID for tracking confirmations
+        blocks: Slack Block Kit blocks
+        thread_messages: Messages to post in thread (detailed info)
+        main_message_update: Text to update the main message with (result line)
+        awx_url: AWX job URL to include in main message
     """
     status: MCPResultStatus
     message: str
@@ -78,6 +82,9 @@ class MCPResult:
     confirmation_prompt: Optional[str] = None
     action_id: Optional[str] = None
     blocks: Optional[List[Dict[str, Any]]] = None  # Slack Block Kit blocks
+    thread_messages: Optional[List[str]] = None  # Messages to post in thread
+    main_message_update: Optional[str] = None  # Update to main message (result line)
+    awx_url: Optional[str] = None  # AWX job link for main message
 
     def to_slack_message(self) -> Dict[str, Any]:
         """Convert result to Slack message format."""

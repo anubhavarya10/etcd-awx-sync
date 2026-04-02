@@ -7,6 +7,7 @@ Supports filtering by domain (customer) and role.
 
 import etcd3
 import requests
+import urllib3
 import json
 import os
 import sys
@@ -14,6 +15,9 @@ import argparse
 import re
 import time
 from typing import Dict, List, Any, Optional, Tuple, Set, Callable
+
+# Disable SSL warnings for self-signed certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuration - can be overridden by environment variables
 ETCD_SERVER = os.environ.get("ETCD_SERVER", "localhost")
@@ -63,21 +67,22 @@ def check_required_env_vars():
 
 
 def get_awx_api_url() -> str:
-    """Get the base AWX API URL (HTTP)."""
-    return f"http://{AWX_SERVER}/api/v2"
+    """Get the base AWX API URL."""
+    return f"https://{AWX_SERVER}/api/v2"
 
 
 def create_awx_session() -> requests.Session:
     """Create an authenticated AWX session."""
     session = requests.Session()
     session.headers.update({'Content-Type': 'application/json'})
+    session.verify = False  # Self-signed cert on AWX
 
     if AWX_TOKEN:
         session.headers.update({'Authorization': f'Bearer {AWX_TOKEN}'})
         return session
 
     if AWX_CLIENT_ID and AWX_CLIENT_SECRET and AWX_USERNAME and AWX_PASSWORD:
-        token_url = f"http://{AWX_SERVER}/api/o/token/"
+        token_url = f"https://{AWX_SERVER}/api/o/token/"
         data = {
             "grant_type": "password",
             "client_id": AWX_CLIENT_ID,
@@ -85,7 +90,7 @@ def create_awx_session() -> requests.Session:
             "username": AWX_USERNAME,
             "password": AWX_PASSWORD
         }
-        response = requests.post(token_url, data=data)
+        response = requests.post(token_url, data=data, verify=False)
         if response.status_code != 200:
             print(f"OAuth token request failed: {response.status_code}")
             print(f"Response: {response.text}")
@@ -417,9 +422,11 @@ def get_host_groups(hostname: str, customer: str = None, role: str = None) -> Li
     if customer:
         groups.append(f"customer-{customer}")
 
-    # Role group
+    # Role group - add both prefixed and plain name for playbook compatibility
+    # Playbooks typically use `hosts: tps` not `hosts: role-tps`
     if role:
         groups.append(f"role-{role}")
+        groups.append(role)  # Plain role name for playbook compatibility
 
     # Server type groups
     if 'gen-comp' in hostname_lower:

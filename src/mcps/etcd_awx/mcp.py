@@ -4,8 +4,12 @@ import os
 import asyncio
 import time
 import logging
+import urllib3
 from typing import Any, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
+
+# Disable SSL warnings for self-signed certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from ..base import BaseMCP, MCPAction, MCPResult, MCPResultStatus
 
@@ -376,7 +380,7 @@ class EtcdAwxMCP(BaseMCP):
             if existing:
                 inv_id = existing.get("id")
                 host_count = existing.get("total_hosts", 0)
-                inv_link = f"<http://{self.awx_server}/#/inventories/inventory/{inv_id}/hosts|{inventory_name}>"
+                inv_link = f"<https://{self.awx_server}/#/inventories/inventory/{inv_id}/hosts|{inventory_name}>"
                 return MCPResult(
                     status=MCPResultStatus.SUCCESS,
                     message=(
@@ -441,12 +445,13 @@ class EtcdAwxMCP(BaseMCP):
                 logger.warning("AWX credentials not set, skipping inventory existence check")
                 return None
 
-            url = f"http://{awx_server}/api/v2/inventories/"
+            url = f"https://{awx_server}/api/v2/inventories/"
             response = requests.get(
                 url,
                 params={"name": inventory_name},
                 auth=(awx_username, awx_password),
-                timeout=10
+                timeout=10,
+                verify=False
             )
 
             if response.status_code == 200:
@@ -743,7 +748,7 @@ class EtcdAwxMCP(BaseMCP):
                 # Build AWX link
                 inv_link = result["inventory_name"]
                 if result.get("inventory_id"):
-                    inv_link = f"<http://{self.awx_server}/#/inventories/inventory/{result['inventory_id']}/hosts|{result['inventory_name']}>"
+                    inv_link = f"<https://{self.awx_server}/#/inventories/inventory/{result['inventory_id']}/hosts|{result['inventory_name']}>"
 
                 # Build filter description
                 filter_parts = []

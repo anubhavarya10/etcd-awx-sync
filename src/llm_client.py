@@ -164,14 +164,14 @@ class UnityAIClient(BaseLLMClient):
         self,
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
-        model: str = "claude-3-sonnet",
+        model: Optional[str] = None,
     ):
         self.api_key = api_key or os.environ.get("UNITY_AI_API_KEY")
         self.api_base = api_base or os.environ.get(
             "UNITY_AI_API_BASE",
             "https://api.unity.ai/v1"
         )
-        self.model = model or os.environ.get("UNITY_AI_MODEL", "claude-3-sonnet")
+        self.model = model or os.environ.get("UNITY_AI_MODEL", "default")
 
         if not self.api_key:
             raise ValueError("UNITY_AI_API_KEY is required")
@@ -216,10 +216,10 @@ class AnthropicClient(BaseLLMClient):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "claude-3-sonnet-20240229",
+        model: Optional[str] = None,
     ):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-3-sonnet-20240229")
+        self.model = model or os.environ.get("ANTHROPIC_MODEL", "default")
         self.api_base = "https://api.anthropic.com/v1"
 
         if not self.api_key:
@@ -276,9 +276,93 @@ class MockLLMClient(BaseLLMClient):
         temperature: float = 0.0,
     ) -> LLMResponse:
         """Return a mock response based on sentence patterns (dynamic, no hardcoded lists)."""
-        user_lower = user_message.lower().strip()
-        # Clean up the message - remove punctuation except hyphens
         import re
+        user_lower = user_message.lower().strip()
+
+        # === startvops COMMANDS (Service Manager MCP) ===
+        # Trigger: startvops <action> <role> in/on <domain>
+        if user_lower.startswith('startvops'):
+            # Remove the startvops prefix and parse the rest
+            startvops_msg = user_lower[len('startvops'):].strip()
+            startvops_words = re.findall(r'[\w-]+', startvops_msg)
+
+            # Known service roles
+            service_roles = {'mim', 'mphpp', 'mphhos', 'ts', 'www', 'www5', 'ngx', 'ngxint',
+                            'redis', 'mongodb', 'tps', 'harjo', 'hamim', 'haweb', 'srouter',
+                            'sdecoder', 'scapture', 'ser', 'sconductor', 'mimmem', 'provnstatdb5'}
+
+            # Parse action and parameters
+            action = None
+            role = None
+            domain = None
+            host = None
+            lines = 50
+
+            # Detect action keywords
+            if any(w in startvops_words for w in ['check', 'status']):
+                action = 'check-service'
+            elif 'restart' in startvops_words:
+                action = 'restart-service'
+            elif 'start' in startvops_words:
+                action = 'start-service'
+            elif 'stop' in startvops_words:
+                action = 'stop-service'
+            elif any(w in startvops_words for w in ['logs', 'log', 'journal']):
+                action = 'service-logs'
+            elif any(w in startvops_words for w in ['list', 'roles', 'help']):
+                action = 'list-service-roles'
+
+            # Extract role and domain
+            skip_words = {'check', 'status', 'restart', 'start', 'stop', 'logs', 'log',
+                         'journal', 'in', 'on', 'for', 'the', 'service', 'list', 'roles', 'help'}
+            potential_terms = [w for w in startvops_words if w not in skip_words and len(w) >= 2]
+
+            for term in potential_terms:
+                if term in service_roles and not role:
+                    role = term
+                elif role and not domain:
+                    domain = term
+
+            # Handle list-service-roles (no role/domain needed)
+            if action == 'list-service-roles':
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "service-manager",
+                        "action": "list-service-roles",
+                        "parameters": {},
+                        "confidence": 0.99,
+                        "explanation": "List available service roles"
+                    }),
+                    model="mock",
+                )
+
+            # If we have role and domain, return the action
+            if role and domain and action:
+                params = {"role": role, "domain": domain}
+                return LLMResponse(
+                    content=json.dumps({
+                        "mcp_name": "service-manager",
+                        "action": action,
+                        "parameters": params,
+                        "confidence": 0.99,
+                        "explanation": f"{action} for {role} in {domain}"
+                    }),
+                    model="mock",
+                )
+
+            # If we couldn't parse, return help
+            return LLMResponse(
+                content=json.dumps({
+                    "mcp_name": "service-manager",
+                    "action": "list-service-roles",
+                    "parameters": {},
+                    "confidence": 0.8,
+                    "explanation": "Could not parse /startvops command, showing help"
+                }),
+                model="mock",
+            )
+
+        # Clean up the message - remove punctuation except hyphens
         words = re.findall(r'[\w-]+', user_lower)
 
         # Skip common words when looking for role/domain
@@ -289,7 +373,8 @@ class MockLLMClient(BaseLLMClient):
             'want', 'need', 'would', 'like', 'to', 'see', 'hosts', 'servers',
             'host', 'server', 'domain', 'domains', 'role', 'roles', 'inventory',
             'create', 'sync', 'status', 'help', 'with', 'of', 'from', 'and', 'or',
-            'playbook', 'playbooks', 'run', 'job', 'jobs', 'on', 'repo'
+            'playbook', 'playbooks', 'run', 'job', 'jobs', 'on', 'repo',
+            'globally', 'global'
         }
 
         # Extract potential role/domain - any word that's not a common word
@@ -359,23 +444,53 @@ class MockLLMClient(BaseLLMClient):
                 )
 
         # Set repo - "set repo <org/repo> [path <folder>] [branch <branch>]"
+        # Also handles preset names like "vivox-ops-ansible" or "vivox-ops-docker"
         # Also handles full URLs like https://github.com/org/repo
-        if ("set" in user_lower or "change" in user_lower or "use" in user_lower) and "repo" in user_lower:
+        if ("set" in user_lower or "change" in user_lower or "use" in user_lower or "switch" in user_lower) and "repo" in user_lower:
             params = {}
 
-            # Look for full GitHub URL and extract org/repo
-            import re
-            url_match = re.search(r'github[^/]*/([^/]+/[^/\s]+)', user_lower)
-            if url_match:
-                repo = url_match.group(1)
-                # Remove .git suffix if present
-                repo = repo.replace('.git', '')
-                params["repo"] = repo
-            else:
+            # First check if any preset name is mentioned in the message
+            preset_names = ["vivox-ops-docker", "vivox-ops-ansible"]
+            for preset in preset_names:
+                if preset in user_lower:
+                    params["repo"] = preset
+                    break
+
+            if not params.get("repo"):
+                # Also match partial preset names (e.g. "ansible", "docker")
+                partial_map = {
+                    "ansible": "vivox-ops-ansible",
+                    "ops-ansible": "vivox-ops-ansible",
+                    "docker": "vivox-ops-docker",
+                    "ops-docker": "vivox-ops-docker",
+                }
+                for partial, full_name in partial_map.items():
+                    if partial in user_lower:
+                        params["repo"] = full_name
+                        break
+
+            if not params.get("repo"):
+                # Look for full GitHub URL and extract org/repo (only 2 path segments)
+                url_match = re.search(r'github[^/]*/([^/\s]+/[^/\s]+?)(?:/|\.git|$)', user_lower)
+                if url_match:
+                    repo = url_match.group(1)
+                    repo = repo.replace('.git', '')
+                    params["repo"] = repo
+
+            if not params.get("repo"):
                 # Find repo (contains / but not http)
                 for term in potential_terms:
                     if "/" in term and "http" not in term:
                         params["repo"] = term
+                        break
+
+            if not params.get("repo"):
+                # Last resort: look for any word with hyphens that could be a repo name
+                all_words = re.findall(r'[\w-]+', user_lower)
+                repo_skip = {'set', 'change', 'use', 'switch', 'repo', 'to', 'the', 'path', 'branch'}
+                for w in all_words:
+                    if w not in repo_skip and '-' in w and len(w) >= 5:
+                        params["repo"] = w
                         break
 
             # Find path (after "path" keyword)
@@ -524,11 +639,14 @@ class MockLLMClient(BaseLLMClient):
                 model="mock",
             )
 
-        # Run playbook - "run <playbook> on <inventory>"
+        # Run playbook - "run <playbook> on <inventory>" or "run <playbook> globally"
         if has_run and (has_playbook or ".yml" in user_lower or ".yaml" in user_lower or potential_terms):
             params = {}
             playbook_name = None
             inventory_name = None
+
+            # Check for global mode: "run <playbook> globally" or "run <playbook> global"
+            has_global = any(w in ('globally', 'global') for w in words)
 
             # Find "on" to split playbook and inventory
             on_idx = None
@@ -537,9 +655,18 @@ class MockLLMClient(BaseLLMClient):
                     on_idx = i
                     break
 
-            # Find playbook name - anything between run/playbook and "on"
-            # or first potential term if no "on"
-            if on_idx is not None:
+            if has_global:
+                # Global mode - find playbook name (first non-skip word)
+                for w in words:
+                    if w not in skip_words and w not in ('globally', 'global') and len(w) >= 2:
+                        playbook_name = w
+                        break
+                if playbook_name:
+                    params["playbook"] = playbook_name
+                    params["inventory"] = "central inventory"
+                    params["global_mode"] = True
+            elif on_idx is not None:
+                # Find playbook name - anything between run/playbook and "on"
                 # Terms before "on" (excluding command words)
                 for w in words[:on_idx]:
                     if w not in skip_words and len(w) >= 2:
@@ -550,15 +677,16 @@ class MockLLMClient(BaseLLMClient):
                     if len(w) >= 2:  # inventory names like mim-aptus2
                         inventory_name = w
                         break
+                if playbook_name:
+                    params["playbook"] = playbook_name
+                if inventory_name:
+                    params["inventory"] = inventory_name
             else:
-                # No "on", just get first meaningful term
+                # No "on" and no "globally", just get first meaningful term
                 if potential_terms:
                     playbook_name = potential_terms[0]
-
-            if playbook_name:
-                params["playbook"] = playbook_name
-            if inventory_name:
-                params["inventory"] = inventory_name
+                if playbook_name:
+                    params["playbook"] = playbook_name
 
             if params:
                 return LLMResponse(

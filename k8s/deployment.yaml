@@ -6,6 +6,7 @@ metadata:
     app: slack-mcp-agent
 spec:
   replicas: 1
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: slack-mcp-agent

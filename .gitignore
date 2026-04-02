@@ -5,6 +5,16 @@
 *.env
 !.env.example
 
+# Session context / notes (may contain secrets or internal details)
+claude.md
+CLAUDE.md
+*_claude.md
+awx_slack.md
+pods_claude.md
+service_claude.md
+tf_claude.md
+save_prj.md
+
 # Python
 __pycache__/
 *.py[cod]
